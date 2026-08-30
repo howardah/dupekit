@@ -9,7 +9,7 @@ use std::{
 };
 
 pub use dupekit_core::{
-    DuplicateFile, DuplicateFileId, DuplicateGroup, GroupId, ScanPath, ScanSummary,
+    CleanupOutcome, DuplicateFile, DuplicateFileId, DuplicateGroup, GroupId, ScanPath, ScanSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -97,6 +97,19 @@ pub struct NewCleanupAction {
     pub affected_files: u64,
     pub recovered_bytes: u64,
 }
+/// A cleanup audit entry with its outcome.  Failed targets are retained rather
+/// than being folded into a misleading "success" count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupHistoryEntry {
+    pub action: CleanupAction,
+    pub attempted_files: u64,
+    pub failures: Vec<CleanupFailureRecord>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupFailureRecord {
+    pub path: PathBuf,
+    pub message: String,
+}
 
 pub struct Database {
     connection: Connection,
@@ -146,6 +159,14 @@ impl Database {
                 .execute("ALTER TABLE scans ADD COLUMN duplicate_groups INTEGER", [])?;
             self.connection
                 .execute("INSERT INTO schema_migrations(version) VALUES(2)", [])?;
+        }
+        if version < 3 {
+            self.connection.execute_batch(
+                "ALTER TABLE cleanup_actions ADD COLUMN attempted_files INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE cleanup_failures (id INTEGER PRIMARY KEY, cleanup_action_id INTEGER NOT NULL REFERENCES cleanup_actions(id) ON DELETE CASCADE, path BLOB NOT NULL, message TEXT NOT NULL);
+                 CREATE INDEX cleanup_failures_action_id ON cleanup_failures(cleanup_action_id);
+                 INSERT INTO schema_migrations(version) VALUES(3);",
+            )?;
         }
         Ok(())
     }
@@ -323,8 +344,77 @@ impl Database {
         {
             return Err(StorageError::ScanNotFound(scan_id));
         }
-        self.connection.execute("INSERT INTO cleanup_actions(scan_id,created_at,action,affected_files,recovered_bytes) VALUES(?1,?2,?3,?4,?5)", params![scan_id,time_to_millis(action.created_at)?,action.action,u64_to_i64(action.affected_files)?,u64_to_i64(action.recovered_bytes)?])?;
+        self.connection.execute("INSERT INTO cleanup_actions(scan_id,created_at,action,affected_files,recovered_bytes,attempted_files) VALUES(?1,?2,?3,?4,?5,?4)", params![scan_id,time_to_millis(action.created_at)?,action.action,u64_to_i64(action.affected_files)?,u64_to_i64(action.recovered_bytes)?])?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Records every cleanup result, including targets skipped because they
+    /// changed after preflight. This is the preferred API for new callers.
+    pub fn record_cleanup_outcome(
+        &mut self,
+        scan_id: ScanId,
+        action_name: &str,
+        created_at: SystemTime,
+        outcome: &CleanupOutcome,
+    ) -> Result<i64> {
+        let tx = self.connection.transaction()?;
+        let exists: Option<i64> = tx
+            .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if exists.is_none() {
+            return Err(StorageError::ScanNotFound(scan_id));
+        }
+        tx.execute(
+            "INSERT INTO cleanup_actions(scan_id,created_at,action,affected_files,recovered_bytes,attempted_files) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![scan_id, time_to_millis(created_at)?, action_name, u64_to_i64(outcome.removed.len() as u64)?, u64_to_i64(outcome.recovered_bytes)?, u64_to_i64((outcome.removed.len() + outcome.failures.len()) as u64)?],
+        )?;
+        let action_id = tx.last_insert_rowid();
+        for failure in &outcome.failures {
+            tx.execute(
+                "INSERT INTO cleanup_failures(cleanup_action_id,path,message) VALUES(?1,?2,?3)",
+                params![action_id, encode_path(&failure.path), failure.message],
+            )?;
+        }
+        tx.commit()?;
+        Ok(action_id)
+    }
+
+    /// Removes successfully cleaned files from a stored result set, drops
+    /// groups with fewer than two remaining files, and recalculates the scan
+    /// summary. Failed or skipped targets remain selectable for a later scan.
+    pub fn reconcile_removed_files(&mut self, scan_id: ScanId, paths: &[PathBuf]) -> Result<()> {
+        let tx = self.connection.transaction()?;
+        let exists: Option<i64> = tx
+            .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if exists.is_none() {
+            return Err(StorageError::ScanNotFound(scan_id));
+        }
+        for path in paths {
+            tx.execute(
+                "DELETE FROM duplicate_files WHERE id IN (SELECT f.id FROM duplicate_files f JOIN duplicate_groups g ON f.group_id=g.id WHERE g.scan_id=?1 AND f.path=?2)",
+                params![scan_id, encode_path(path)],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM duplicate_groups WHERE scan_id=?1 AND id IN (SELECT g.id FROM duplicate_groups g LEFT JOIN duplicate_files f ON f.group_id=g.id WHERE g.scan_id=?1 GROUP BY g.id HAVING COUNT(f.id) < 2)",
+            [scan_id],
+        )?;
+        let (groups, files, bytes): (i64, i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(file_count),0), COALESCE(SUM(file_size * selected_count),0) FROM (SELECT g.id, g.file_size, COUNT(f.id) AS file_count, SUM(f.selected) AS selected_count FROM duplicate_groups g JOIN duplicate_files f ON f.group_id=g.id WHERE g.scan_id=?1 GROUP BY g.id)",
+            [scan_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        tx.execute(
+            "UPDATE scans SET duplicate_groups=?2, duplicate_files=?3, duplicate_bytes=?4 WHERE id=?1",
+            params![scan_id, groups, files, bytes],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     /// Returns a scan's cleanup audit entries, newest first.
     pub fn cleanup_history(&self, scan_id: ScanId) -> Result<Vec<CleanupAction>> {
@@ -341,6 +431,51 @@ impl Database {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?)
+    }
+    /// Returns detailed cleanup history, including individual skipped targets.
+    pub fn cleanup_history_details(&self, scan_id: ScanId) -> Result<Vec<CleanupHistoryEntry>> {
+        let mut stmt = self.connection.prepare("SELECT id,scan_id,created_at,action,affected_files,recovered_bytes,attempted_files FROM cleanup_actions WHERE scan_id=?1 ORDER BY created_at DESC,id DESC")?;
+        let actions = stmt
+            .query_map([scan_id], |row| {
+                Ok((
+                    CleanupAction {
+                        id: row.get(0)?,
+                        scan_id: row.get(1)?,
+                        created_at: millis_to_time(row.get(2)?)?,
+                        action: row.get(3)?,
+                        affected_files: i64_to_u64(row.get(4)?)?,
+                        recovered_bytes: i64_to_u64(row.get(5)?)?,
+                    },
+                    i64_to_u64(row.get(6)?)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        actions
+            .into_iter()
+            .map(|(action, attempted_files)| {
+                let mut failures = self.connection.prepare(
+                    "SELECT path,message FROM cleanup_failures WHERE cleanup_action_id=?1 ORDER BY id",
+                )?;
+                let failures = failures
+                    .query_map([action.id], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|(path, message)| {
+                        Ok(CleanupFailureRecord {
+                            path: decode_path(&path)?,
+                            message,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CleanupHistoryEntry {
+                    action,
+                    attempted_files,
+                    failures,
+                })
+            })
+            .collect()
     }
     /// Removes a historic scan and its dependent rows without touching files on disk.
     pub fn delete_scan(&self, scan_id: ScanId) -> Result<()> {
@@ -625,6 +760,58 @@ mod tests {
         assert_eq!(db.scan(old).unwrap().status, ScanStatus::Cancelled);
         db.delete_scan(old).unwrap();
         assert!(matches!(db.scan(old), Err(StorageError::ScanNotFound(_))));
+    }
+
+    #[test]
+    fn detailed_cleanup_history_preserves_partial_failures() {
+        let (_file, mut db) = db();
+        let id = db.create_scan(&scan(PathBuf::from("/a"))).unwrap();
+        let outcome = CleanupOutcome {
+            action: dupekit_core::CleanupAction::PermanentDelete,
+            removed: vec![PathBuf::from("/a/removed")],
+            recovered_bytes: 20,
+            failures: vec![dupekit_core::CleanupFailure {
+                path: PathBuf::from("/a/changed"),
+                message: "file changed since it was scanned".into(),
+            }],
+        };
+        db.record_cleanup_outcome(id, "permanent delete", at(2), &outcome)
+            .unwrap();
+
+        let history = db.cleanup_history_details(id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].attempted_files, 2);
+        assert_eq!(history[0].action.affected_files, 1);
+        assert_eq!(history[0].failures[0].path, PathBuf::from("/a/changed"));
+    }
+
+    #[test]
+    fn reconciliation_removes_cleaned_files_and_empty_duplicate_groups() {
+        let (_file, mut db) = db();
+        let id = db.create_scan(&scan(PathBuf::from("/a"))).unwrap();
+        db.replace_results(
+            id,
+            &results(),
+            &ScanSummary {
+                duplicate_groups: 1,
+                duplicate_files: 2,
+                recoverable_bytes: 20,
+            },
+            at(2),
+        )
+        .unwrap();
+        db.reconcile_removed_files(id, &[PathBuf::from("/backup/été a.jpg")])
+            .unwrap();
+
+        assert!(db.groups(id).unwrap().is_empty());
+        assert_eq!(
+            db.scan(id).unwrap().summary,
+            Some(ScanSummary {
+                duplicate_groups: 0,
+                duplicate_files: 0,
+                recoverable_bytes: 0,
+            })
+        );
     }
 
     #[cfg(unix)]

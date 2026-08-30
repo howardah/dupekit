@@ -145,9 +145,10 @@ impl DuplicateScanner for FclonesScanner {
             .collect();
         let discovered = groups.iter().map(|g| g.files.len() as u64).sum();
         let _ = events.send(ScanEvent::FilesDiscovered(discovered));
-        for group in &groups {
-            let _ = events.send(ScanEvent::GroupFound(group.clone()));
-        }
+        // Results are returned atomically with `Finished`; sending a cloned
+        // group for every match only builds an unbounded queue while the UI is
+        // busy scanning. In a large scan that can mean hundreds of thousands
+        // of needless allocations, and no current consumer uses those events.
         let result = ScanResult::from_groups(groups);
         let _ = events.send(ScanEvent::Finished(result.summary.clone()));
         Ok(result)
@@ -172,6 +173,8 @@ impl Log for EventLog {
             events: self.events.clone(),
             processed: self.processed.clone(),
             total,
+            last_emitted: AtomicU64::new(0),
+            minimum_step: total.map(|n| (n / 200).max(1)).unwrap_or(1_024),
         })
     }
     fn log(&self, _: LogLevel, msg: String) {
@@ -185,10 +188,27 @@ struct EventProgress {
     events: Sender<ScanEvent>,
     processed: Arc<AtomicU64>,
     total: Option<u64>,
+    last_emitted: AtomicU64,
+    minimum_step: u64,
 }
 impl ProgressTracker for EventProgress {
     fn inc(&self, delta: u64) {
         let processed = self.processed.fetch_add(delta, Ordering::AcqRel) + delta;
+        let last = self.last_emitted.load(Ordering::Acquire);
+        if processed != self.total.unwrap_or(u64::MAX)
+            && processed.saturating_sub(last) < self.minimum_step
+        {
+            return;
+        }
+        // Only the caller that advances the watermark emits. Concurrent
+        // workers may skip an intermediate update, but never fabricate one.
+        if self
+            .last_emitted
+            .compare_exchange(last, processed, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let _ = self.events.send(ScanEvent::Progress {
             processed,
             total: self.total,
@@ -230,6 +250,32 @@ mod tests {
             Err(ScanError::Cancelled)
         ));
         assert!(matches!(r.recv().unwrap(), ScanEvent::Cancelled));
+    }
+
+    #[test]
+    fn progress_events_are_coalesced_but_finish_at_the_reported_total() {
+        let (sender, receiver) = mpsc::channel();
+        let progress = EventProgress {
+            events: sender,
+            processed: Arc::new(AtomicU64::new(0)),
+            total: Some(1_000),
+            last_emitted: AtomicU64::new(0),
+            minimum_step: 100,
+        };
+
+        for _ in 0..1_000 {
+            progress.inc(1);
+        }
+
+        let updates = receiver.try_iter().collect::<Vec<_>>();
+        assert!(updates.len() <= 10);
+        assert!(matches!(
+            updates.last(),
+            Some(ScanEvent::Progress {
+                processed: 1_000,
+                total: Some(1_000)
+            })
+        ));
     }
     #[test]
     fn finds_duplicates_and_initially_keeps_preferred_directory() {

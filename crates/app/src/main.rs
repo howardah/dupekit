@@ -1,10 +1,10 @@
 //! Native Iced MVP. Results are paged, so the widget tree remains bounded.
 use dupekit_core::{
     CancellationToken, CleanupAction, CleanupService, DuplicateFile, DuplicateFileId,
-    DuplicateGroup, DuplicateScanner, FclonesScanner, ScanConfig, ScanPath, ScanResult,
+    DuplicateGroup, DuplicateScanner, FclonesScanner, ScanConfig, ScanEvent, ScanPath, ScanResult,
     SelectionPolicy as CoreSelectionPolicy,
 };
-use dupekit_storage::{Database, NewCleanupAction, NewScan, ScanId};
+use dupekit_storage::{Database, NewScan, ScanId, ScanStatus};
 use iced::widget::{
     Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
     text_input,
@@ -13,7 +13,7 @@ use iced::{
     Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector,
     alignment, time,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::mpsc::Receiver, time::Duration};
 
 const GROUPS_PER_PAGE: usize = 12;
 
@@ -73,16 +73,14 @@ struct HistoryItem {
     id: ScanId,
     name: String,
     date: String,
+    status: ScanStatus,
     groups: usize,
     bytes: u64,
 }
 #[derive(Debug, Clone)]
 enum Screen {
     Home,
-    Scanning {
-        progress: f32,
-        phase: usize,
-    },
+    Scanning(ScanProgress),
     Results(ScanResults),
     Confirm {
         permanent: bool,
@@ -97,6 +95,70 @@ enum Screen {
     },
     History,
 }
+
+/// This is deliberately a view of the scanner's last event, rather than an
+/// estimate. `pulse` only animates an unknown-length activity indicator.
+#[derive(Debug, Clone, PartialEq)]
+struct ScanProgress {
+    phase: String,
+    processed: u64,
+    total: Option<u64>,
+    pulse: f32,
+}
+
+impl Default for ScanProgress {
+    fn default() -> Self {
+        Self {
+            phase: "Starting scan".into(),
+            processed: 0,
+            total: None,
+            pulse: 0.0,
+        }
+    }
+}
+
+impl ScanProgress {
+    fn apply(&mut self, event: &ScanEvent) {
+        match event {
+            ScanEvent::Started => {
+                self.phase = "Starting scan".into();
+                self.processed = 0;
+                self.total = None;
+            }
+            ScanEvent::PhaseStarted { name, total } => {
+                self.phase = name.clone();
+                self.processed = 0;
+                self.total = *total;
+            }
+            ScanEvent::Progress { processed, total } => {
+                // Progress trackers can be updated by concurrent workers.
+                // Ignore an older delivery rather than making a real bar move
+                // backwards.
+                self.processed = self.processed.max(*processed);
+                // A tracker supplies its total with every update. Preserve a
+                // preceding total only if a backend ever omits it.
+                if total.is_some() {
+                    self.total = *total;
+                }
+            }
+            ScanEvent::FilesDiscovered(count) => {
+                self.phase = format!("Found {count} files in duplicate groups");
+                self.processed = *count;
+                self.total = None;
+            }
+            ScanEvent::GroupFound(_)
+            | ScanEvent::Finished(_)
+            | ScanEvent::Failed(_)
+            | ScanEvent::Cancelled => {}
+        }
+    }
+
+    fn fraction(&self) -> Option<f32> {
+        self.total.and_then(|total| {
+            (total > 0).then_some((self.processed.min(total) as f32 / total as f32).min(1.0))
+        })
+    }
+}
 struct App {
     screen: Screen,
     paths: Vec<ScanPath>,
@@ -105,6 +167,12 @@ struct App {
     cache: bool,
     history: Vec<HistoryItem>,
     scan_cancel: Option<CancellationToken>,
+    scan_events: Option<Receiver<ScanEvent>>,
+    next_scan_run: u64,
+    active_scan_run: Option<u64>,
+    running_scan_id: Option<ScanId>,
+    next_cleanup_run: u64,
+    active_cleanup_run: Option<u64>,
     latest_result: Option<ScanResult>,
     db: Database,
     active_scan_id: Option<ScanId>,
@@ -114,7 +182,7 @@ impl App {
     fn new() -> Self {
         let db = Database::open("dupekit.sqlite3")
             .unwrap_or_else(|_| Database::open_in_memory().expect("SQLite must be available"));
-        let history = history_items(&db);
+        let history = history_items(&db).unwrap_or_default();
         Self {
             screen: Screen::Home,
             paths: vec![],
@@ -123,6 +191,12 @@ impl App {
             cache: true,
             history,
             scan_cancel: None,
+            scan_events: None,
+            next_scan_run: 0,
+            active_scan_run: None,
+            running_scan_id: None,
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
             latest_result: None,
             db,
             active_scan_id: None,
@@ -140,8 +214,15 @@ enum Message {
     MaxSize(String),
     ToggleCache(bool),
     StartScan,
-    ScanCompleted(Result<dupekit_core::ScanResult, String>),
-    CleanupCompleted(Result<dupekit_core::CleanupOutcome, String>),
+    ScanCompleted {
+        run: u64,
+        result: Result<dupekit_core::ScanResult, String>,
+    },
+    CleanupCompleted {
+        run: u64,
+        scan_id: Option<ScanId>,
+        result: Result<dupekit_core::CleanupOutcome, String>,
+    },
     Tick,
     CancelScan,
     ToggleFile(DuplicateFileId),
@@ -161,7 +242,7 @@ enum Message {
 
 fn subscription(app: &App) -> Subscription<Message> {
     match app.screen {
-        Screen::Scanning { .. } => time::every(Duration::from_millis(120)).map(|_| Message::Tick),
+        Screen::Scanning(_) => time::every(Duration::from_millis(80)).map(|_| Message::Tick),
         _ => Subscription::none(),
     }
 }
@@ -199,16 +280,45 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::MaxSize(v) => app.max_size = v,
         Message::ToggleCache(v) => app.cache = v,
         Message::StartScan => {
-            if !app.paths.is_empty() {
+            if app.active_scan_run.is_some() {
+                app.notice = Some(
+                    "A scan is already running. Cancel or wait for it to finish first.".into(),
+                );
+                return Task::none();
+            }
+            if app.paths.is_empty() {
+                app.notice = Some("Add at least one folder before starting a scan.".into());
+            } else {
+                let min_size = match parse_size_input(&app.min_size, "Minimum file size") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        app.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                let max_size = match parse_size_input(&app.max_size, "Maximum file size") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        app.notice = Some(error);
+                        return Task::none();
+                    }
+                };
+                if min_size.zip(max_size).is_some_and(|(min, max)| min > max) {
+                    app.notice = Some("Minimum file size cannot exceed maximum file size.".into());
+                    return Task::none();
+                }
                 app.notice = None;
                 let config = ScanConfig {
                     paths: app.paths.clone(),
-                    min_size: parse_size(&app.min_size),
-                    max_size: parse_size(&app.max_size),
+                    min_size,
+                    max_size,
                     cache: app.cache,
                 };
+                app.next_scan_run = app.next_scan_run.wrapping_add(1);
+                let run = app.next_scan_run;
                 let cancellation = CancellationToken::default();
                 let worker_cancellation = cancellation.clone();
+                let (events, event_receiver) = std::sync::mpsc::channel();
                 app.active_scan_id = match app.db.create_scan(&NewScan {
                     name: Some("Scan".into()),
                     started_at: std::time::SystemTime::now(),
@@ -220,89 +330,154 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         None
                     }
                 };
+                app.running_scan_id = app.active_scan_id;
                 app.scan_cancel = Some(cancellation);
-                app.screen = Screen::Scanning {
-                    progress: 0.0,
-                    phase: 0,
-                };
+                app.scan_events = Some(event_receiver);
+                app.active_scan_run = Some(run);
+                app.screen = Screen::Scanning(ScanProgress::default());
                 return Task::perform(
                     async move {
-                        let (events, _ignored_events) = std::sync::mpsc::channel();
-                        FclonesScanner
+                        let result = FclonesScanner
                             .scan(config, events, worker_cancellation)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| error.to_string());
+                        Message::ScanCompleted { run, result }
                     },
-                    Message::ScanCompleted,
+                    |message| message,
                 );
             }
         }
-        Message::ScanCompleted(Ok(result)) => {
+        Message::ScanCompleted { run, result } => {
+            if app.active_scan_run != Some(run) {
+                return Task::none();
+            }
+            app.scan_events = None;
             app.scan_cancel = None;
-            let mut displayed_result = result;
-            if let Some(id) = app.active_scan_id {
-                let _ = app.db.replace_results(
-                    id,
-                    &displayed_result.groups,
-                    &displayed_result.summary,
-                    std::time::SystemTime::now(),
-                );
-                // Reload database-owned IDs so subsequent checkbox updates target
-                // the correct persisted files, including after multiple scans.
-                if let Ok(groups) = app.db.groups(id) {
-                    displayed_result = ScanResult::from_groups(groups);
+            app.active_scan_run = None;
+            match result {
+                Ok(result) => {
+                    let mut displayed_result = result;
+                    if let Some(id) = app.running_scan_id.take() {
+                        let persisted = match app.db.replace_results(
+                            id,
+                            &displayed_result.groups,
+                            &displayed_result.summary,
+                            std::time::SystemTime::now(),
+                        ) {
+                            Ok(()) => match app.db.groups(id) {
+                                // Reload database-owned IDs so subsequent checkbox updates
+                                // target exactly this saved result set.
+                                Ok(groups) => {
+                                    displayed_result = ScanResult::from_groups(groups);
+                                    true
+                                }
+                                Err(error) => {
+                                    append_notice(
+                                        app,
+                                        format!(
+                                            "Scan finished, but saved results could not be reloaded: {error}"
+                                        ),
+                                    );
+                                    false
+                                }
+                            },
+                            Err(error) => {
+                                append_notice(
+                                    app,
+                                    format!(
+                                        "Scan finished, but results could not be saved: {error}"
+                                    ),
+                                );
+                                // Do not let scanner-owned IDs masquerade as database IDs.
+                                false
+                            }
+                        };
+                        refresh_history(app);
+                        if persisted && matches!(app.screen, Screen::Scanning(_)) {
+                            app.active_scan_id = Some(id);
+                        }
+                    }
+                    if matches!(app.screen, Screen::Scanning(_)) {
+                        app.latest_result = Some(displayed_result.clone());
+                        app.screen = Screen::Results(ScanResults {
+                            groups: displayed_result.groups,
+                            page: 0,
+                            scan_name: "Current scan".into(),
+                        });
+                    }
                 }
-                app.history = history_items(&app.db);
-            }
-            if matches!(app.screen, Screen::Scanning { .. }) {
-                app.latest_result = Some(displayed_result.clone());
-                app.screen = Screen::Results(ScanResults {
-                    groups: displayed_result.groups,
-                    page: 0,
-                    scan_name: "Current scan".into(),
-                });
-            }
-        }
-        Message::ScanCompleted(Err(error)) => {
-            app.scan_cancel = None;
-            if let Some(id) = app.active_scan_id {
-                let _ = app.db.finish_scan(
-                    id,
-                    dupekit_storage::ScanStatus::Failed,
-                    std::time::SystemTime::now(),
-                );
-                app.history = history_items(&app.db);
-            }
-            if matches!(app.screen, Screen::Scanning { .. }) {
-                app.notice = Some(format!("Scan failed: {error}"));
-                app.screen = Screen::Home;
+                Err(error) => {
+                    if let Some(id) = app.running_scan_id.take() {
+                        if let Err(persist_error) = app.db.finish_scan(
+                            id,
+                            dupekit_storage::ScanStatus::Failed,
+                            std::time::SystemTime::now(),
+                        ) {
+                            append_notice(
+                                app,
+                                format!(
+                                    "Scan failed and history could not be updated: {persist_error}"
+                                ),
+                            );
+                        }
+                        refresh_history(app);
+                        if app.active_scan_id == Some(id) {
+                            app.active_scan_id = None;
+                        }
+                    }
+                    if matches!(app.screen, Screen::Scanning(_)) {
+                        append_notice(app, format!("Scan failed: {error}"));
+                        app.screen = Screen::Home;
+                    }
+                }
             }
         }
         Message::Tick => {
-            if let Screen::Scanning { progress, phase } = &mut app.screen {
-                *progress = (*progress + 0.018).min(1.0);
-                *phase = ((*progress * 4.0) as usize).min(3);
-                if *progress >= 1.0 {
-                    // Actual results arrive through `ScanCompleted`; this timer only keeps
-                    // the phase indicator responsive while fclones runs on Iced's executor.
+            if let Screen::Scanning(progress) = &mut app.screen {
+                if let Some(receiver) = &app.scan_events {
+                    // The scanner itself coalesces progress events. Keep this
+                    // cap as a second guard against a UI stall if another
+                    // backend is ever noisier.
+                    for _ in 0..256 {
+                        let Ok(event) = receiver.try_recv() else {
+                            break;
+                        };
+                        progress.apply(&event);
+                    }
                 }
+                // The pulse communicates ongoing work only when fclones did
+                // not provide a total; it is never presented as completion.
+                progress.pulse = (progress.pulse + 0.08) % 1.0;
             }
         }
         Message::CancelScan => {
             if let Some(cancel) = &app.scan_cancel {
                 cancel.cancel();
             }
-            if let Some(id) = app.active_scan_id {
-                let _ = app.db.finish_scan(
+            let cancelled_scan_id = app.running_scan_id.take();
+            if let Some(id) = cancelled_scan_id {
+                if let Err(error) = app.db.finish_scan(
                     id,
                     dupekit_storage::ScanStatus::Cancelled,
                     std::time::SystemTime::now(),
-                );
-                app.history = history_items(&app.db);
+                ) {
+                    append_notice(
+                        app,
+                        format!("Scan cancellation could not be saved: {error}"),
+                    );
+                }
+                refresh_history(app);
+            }
+            app.scan_cancel = None;
+            app.scan_events = None;
+            app.active_scan_run = None;
+            if app.active_scan_id == cancelled_scan_id {
+                app.active_scan_id = None;
             }
             app.screen = Screen::Home
         }
         Message::ToggleFile(id) => {
             if let Screen::Results(r) = &mut app.screen {
+                let before = r.groups.clone();
                 let was_selected = r
                     .groups
                     .iter()
@@ -321,24 +496,52 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     .groups
                     .iter()
                     .find(|group| group.files.iter().any(|file| file.id == id))
+                    && app.active_scan_id.is_some()
+                    && let Err(error) = app.db.set_selected(id, group.is_selected(id))
                 {
-                    let _ = app.db.set_selected(id, group.is_selected(id));
+                    r.groups = before;
+                    app.notice = Some(format!("Selection was not saved and was reverted: {error}"));
                 }
                 app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
             }
         }
         Message::ApplyPolicy(p) => {
             if let Screen::Results(r) = &mut app.screen {
+                let before = r.groups.clone();
                 apply_policy(&mut r.groups, p, &app.paths);
                 // Clear persisted selections first, then apply the new safe set.
-                for group in &r.groups {
-                    for file in &group.files {
-                        let _ = app.db.set_selected(file.id, false);
+                let all_files = r
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.files.iter().map(|file| file.id))
+                    .collect::<Vec<_>>();
+                let selected_files = r
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.selected_files().map(|file| file.id))
+                    .collect::<Vec<_>>();
+                for file in all_files {
+                    if app.active_scan_id.is_some()
+                        && let Err(error) = app.db.set_selected(file, false)
+                    {
+                        r.groups = before;
+                        app.notice = Some(format!(
+                            "Selection policy was not saved and was reverted: {error}"
+                        ));
+                        app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                        return Task::none();
                     }
                 }
-                for group in &r.groups {
-                    for file in group.selected_files() {
-                        let _ = app.db.set_selected(file.id, true);
+                for file in selected_files {
+                    if app.active_scan_id.is_some()
+                        && let Err(error) = app.db.set_selected(file, true)
+                    {
+                        r.groups = before;
+                        app.notice = Some(format!(
+                            "Selection policy was not saved and was reverted: {error}"
+                        ));
+                        app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                        return Task::none();
                     }
                 }
                 app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
@@ -391,6 +594,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Some(result),
             ) = (app.screen.clone(), app.latest_result.clone())
             {
+                // A cleanup is destructive. Ignore repeat clicks and do not
+                // begin a second operation until this one has reported back.
+                if app.active_cleanup_run.is_some() {
+                    return Task::none();
+                }
                 if permanent && !acknowledged {
                     app.notice = Some("Acknowledge permanent deletion before continuing.".into());
                     return Task::none();
@@ -400,52 +608,111 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 } else {
                     CleanupAction::Trash
                 };
+                app.next_cleanup_run = app.next_cleanup_run.wrapping_add(1);
+                let run = app.next_cleanup_run;
+                let scan_id = app.active_scan_id;
+                app.active_cleanup_run = Some(run);
                 return Task::perform(
                     async move {
-                        CleanupService::plan(&result, action)
+                        let result = CleanupService::plan(&result, action)
                             .map(CleanupService::preflight)
                             .and_then(CleanupService::execute)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| error.to_string());
+                        Message::CleanupCompleted {
+                            run,
+                            scan_id,
+                            result,
+                        }
                     },
-                    Message::CleanupCompleted,
+                    |message| message,
                 );
             }
         }
-        Message::CleanupCompleted(Ok(outcome)) => {
-            if let Some(scan_id) = app.active_scan_id {
-                let _ = app.db.record_cleanup(
+        Message::CleanupCompleted {
+            run,
+            scan_id,
+            result: Ok(outcome),
+        } => {
+            if app.active_cleanup_run != Some(run) {
+                return Task::none();
+            }
+            app.active_cleanup_run = None;
+            if let Some(scan_id) = scan_id {
+                let action_name = if outcome.action == CleanupAction::Trash {
+                    "trash"
+                } else {
+                    "permanent_delete"
+                };
+                if let Err(error) = app.db.record_cleanup_outcome(
                     scan_id,
-                    &NewCleanupAction {
-                        created_at: std::time::SystemTime::now(),
-                        action: if outcome.action == CleanupAction::Trash {
-                            "trash".into()
-                        } else {
-                            "permanent_delete".into()
-                        },
-                        affected_files: outcome.removed.len() as u64,
-                        recovered_bytes: outcome.recovered_bytes,
-                    },
+                    action_name,
+                    std::time::SystemTime::now(),
+                    &outcome,
+                ) {
+                    append_notice(
+                        app,
+                        format!("Files were cleaned, but the cleanup audit was not saved: {error}"),
+                    );
+                }
+                if let Err(error) = app.db.reconcile_removed_files(scan_id, &outcome.removed) {
+                    append_notice(
+                        app,
+                        format!("Files were cleaned, but results could not be reconciled: {error}"),
+                    );
+                } else {
+                    if app.active_scan_id == Some(scan_id) {
+                        match app.db.groups(scan_id) {
+                            Ok(groups) => app.latest_result = Some(ScanResult::from_groups(groups)),
+                            Err(error) => append_notice(
+                                app,
+                                format!(
+                                    "Files were cleaned, but refreshed results could not be loaded: {error}"
+                                ),
+                            ),
+                        }
+                    }
+                    refresh_history(app);
+                }
+            }
+            // Do not pull a user away from a screen they navigated to while
+            // cleanup was running; the audit above still belongs to the scan
+            // that initiated the operation.
+            if matches!(app.screen, Screen::Confirm { .. }) {
+                app.screen = Screen::CleanupDone {
+                    permanent: outcome.action == CleanupAction::PermanentDelete,
+                    count: outcome.removed.len(),
+                    bytes: outcome.recovered_bytes,
+                };
+            }
+            if !outcome.failures.is_empty() {
+                append_notice(
+                    app,
+                    format!(
+                        "{} file(s) could not be cleaned up: {}",
+                        outcome.failures.len(),
+                        outcome
+                            .failures
+                            .iter()
+                            .map(|failure| format!(
+                                "{} ({})",
+                                failure.path.display(),
+                                failure.message
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 );
             }
-            app.screen = Screen::CleanupDone {
-                permanent: outcome.action == CleanupAction::PermanentDelete,
-                count: outcome.removed.len(),
-                bytes: outcome.recovered_bytes,
-            };
-            if !outcome.failures.is_empty() {
-                app.notice = Some(format!(
-                    "{} file(s) could not be cleaned up: {}",
-                    outcome.failures.len(),
-                    outcome
-                        .failures
-                        .iter()
-                        .map(|failure| format!("{} ({})", failure.path.display(), failure.message))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
         }
-        Message::CleanupCompleted(Err(error)) => {
+        Message::CleanupCompleted {
+            run,
+            scan_id: _,
+            result: Err(error),
+        } => {
+            if app.active_cleanup_run != Some(run) {
+                return Task::none();
+            }
+            app.active_cleanup_run = None;
             app.notice = Some(format!("Cleanup was not performed: {error}"));
             if let Some(result) = &app.latest_result {
                 app.screen = Screen::Results(ScanResults {
@@ -460,17 +727,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Home => app.screen = Screen::Home,
         Message::OpenHistory => app.screen = Screen::History,
         Message::DismissNotice => app.notice = None,
-        Message::Reopen(id) => {
-            if let Ok(groups) = app.db.groups(id) {
-                app.active_scan_id = Some(id);
-                app.latest_result = Some(ScanResult::from_groups(groups.clone()));
-                app.screen = Screen::Results(ScanResults {
-                    groups,
-                    page: 0,
-                    scan_name: "Saved scan".into(),
-                });
+        Message::Reopen(id) => match app.db.scan(id) {
+            Err(error) => app.notice = Some(format!("Could not open saved scan: {error}")),
+            Ok(scan) if scan.status != ScanStatus::Completed => {
+                app.notice = Some("Only completed scans have results that can be reopened.".into());
             }
-        }
+            Ok(scan) => match app.db.groups(id) {
+                Err(error) => app.notice = Some(format!("Could not load saved results: {error}")),
+                Ok(groups) => {
+                    app.paths = scan.paths;
+                    app.active_scan_id = Some(id);
+                    app.latest_result = Some(ScanResult::from_groups(groups.clone()));
+                    app.screen = Screen::Results(ScanResults {
+                        groups,
+                        page: 0,
+                        scan_name: scan.name.unwrap_or_else(|| "Saved scan".into()),
+                    });
+                }
+            },
+        },
     };
     Task::none()
 }
@@ -498,45 +773,83 @@ fn totals(groups: &[DuplicateGroup]) -> (usize, u64) {
         groups.iter().map(DuplicateGroup::selected_bytes).sum(),
     )
 }
-fn history_items(db: &Database) -> Vec<HistoryItem> {
-    db.scans()
-        .unwrap_or_default()
+fn refresh_history(app: &mut App) {
+    match history_items(&app.db) {
+        Ok(history) => app.history = history,
+        Err(error) => app.notice = Some(format!("Could not refresh scan history: {error}")),
+    }
+}
+fn append_notice(app: &mut App, message: String) {
+    if let Some(existing) = &mut app.notice {
+        existing.push('\n');
+        existing.push_str(&message);
+    } else {
+        app.notice = Some(message);
+    }
+}
+fn history_items(db: &Database) -> Result<Vec<HistoryItem>, dupekit_storage::StorageError> {
+    Ok(db
+        .scans()?
         .into_iter()
         .map(|scan| {
             let summary = scan.summary.unwrap_or_default();
             HistoryItem {
                 id: scan.id,
                 name: scan.name.unwrap_or_else(|| "Untitled scan".into()),
-                date: "Saved scan".into(),
+                date: format_scan_time(scan.finished_at.unwrap_or(scan.started_at)),
+                status: scan.status,
                 groups: summary.duplicate_groups as usize,
                 bytes: summary.recoverable_bytes,
             }
         })
-        .collect()
+        .collect())
 }
-fn parse_size(value: &str) -> Option<u64> {
+fn format_scan_time(time: std::time::SystemTime) -> String {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("{} UTC", duration.as_secs()),
+        Err(_) => "Unknown date".into(),
+    }
+}
+fn parse_size_input(value: &str, field: &str) -> Result<Option<u64>, String> {
     let value = value.trim();
     if value.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut parts = value.split_whitespace();
-    let number = parts.next()?.parse::<f64>().ok()?;
+    let number_text = parts.next().expect("non-empty input has a first token");
+    let number = number_text.parse::<f64>().map_err(|_| {
+        format!("{field} must be a number followed by an optional unit (for example, 1 MB).")
+    })?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!("{field} must be a finite, non-negative size."));
+    }
     let unit = parts.next().unwrap_or("B").to_ascii_uppercase();
+    if parts.next().is_some() {
+        return Err(format!("{field} has unexpected trailing text."));
+    }
     let multiplier = match unit.as_str() {
         "B" | "BYTE" | "BYTES" => 1.0,
         "K" | "KB" | "KIB" => 1024.0,
         "M" | "MB" | "MIB" => 1024.0 * 1024.0,
         "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
         "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
+        _ => {
+            return Err(format!(
+                "{field} uses an unknown unit. Use B, KB, MB, GB, or TB."
+            ));
+        }
     };
-    (number >= 0.0).then_some((number * multiplier) as u64)
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err(format!("{field} is too large."));
+    }
+    Ok(Some(bytes as u64))
 }
 
 fn view(app: &App) -> Element<'_, Message> {
     let body = match &app.screen {
         Screen::Home => home(app),
-        Screen::Scanning { progress, phase } => scanning(*progress, *phase),
+        Screen::Scanning(progress) => scanning(progress),
         Screen::Results(r) => results(r),
         Screen::Confirm {
             permanent,
@@ -702,47 +1015,38 @@ fn home(app: &App) -> Element<'_, Message> {
     .spacing(18)
     .into()
 }
-fn scanning(progress: f32, phase: usize) -> Element<'static, Message> {
-    let labels = [
-        "Discovering files",
-        "Grouping by size",
-        "Partial hashing",
-        "Full hashing",
-    ];
+fn scanning(progress: &ScanProgress) -> Element<'static, Message> {
+    let (value, detail) = match progress.fraction() {
+        Some(fraction) => (
+            fraction,
+            format!(
+                "{} of {} processed",
+                progress.processed,
+                progress.total.unwrap_or_default()
+            ),
+        ),
+        None => (
+            // Iced does not offer an indeterminate ProgressBar. This moving
+            // segment is explicitly labelled activity, not a percentage.
+            0.15 + progress.pulse * 0.70,
+            "Working — this phase does not report a total".into(),
+        ),
+    };
     let mut body = column![
         text("Scanning locations").size(30),
-        text("Preparing a safe comparison. Progress phases are activity indicators, not an exact percentage.").size(15).color(MUTED),
-        Space::with_height(20)
+        text("Progress comes directly from fclones when it provides a total.")
+            .size(15)
+            .color(MUTED),
+        Space::with_height(20),
+        text(progress.phase.clone()).size(18),
+        text(detail).size(13).color(MUTED),
+        progress_bar(0.0..=1.0, value),
     ]
     .spacing(12);
-    for (i, label) in labels.iter().enumerate() {
-        body = body
-            .push(row![
-                text(*label).width(Length::Fill),
-                text(if i < phase {
-                    "Complete"
-                } else if i == phase {
-                    "Working…"
-                } else {
-                    "Waiting"
-                })
-                .color(if i < phase { SUCCESS } else { MUTED })
-            ])
-            .push(progress_bar(
-                0.0..=1.0,
-                if i < phase {
-                    1.0
-                } else if i == phase {
-                    progress * 4.0 - phase as f32
-                } else {
-                    0.0
-                },
-            ));
-    }
     body = body
         .push(Space::with_height(24))
         .push(
-            text("Scanning continues until fclones finishes comparing files.")
+            text("A bar is only a percentage when the scanner reports its total.")
                 .size(13)
                 .color(MUTED),
         )
@@ -1013,8 +1317,9 @@ fn history(app: &App) -> Element<'_, Message> {
                     column![
                         text(&scan.name).size(17),
                         text(format!(
-                            "{} · {} groups · {} recoverable",
+                            "{} · {} · {} groups · {} recoverable",
                             scan.date,
+                            scan_status_label(scan.status),
                             scan.groups,
                             bytes_label(scan.bytes)
                         ))
@@ -1023,7 +1328,10 @@ fn history(app: &App) -> Element<'_, Message> {
                     .width(Length::Fill),
                     button("Open results")
                         .style(secondary_button)
-                        .on_press(Message::Reopen(scan.id))
+                        .on_press_maybe(
+                            (scan.status == ScanStatus::Completed)
+                                .then_some(Message::Reopen(scan.id))
+                        )
                 ]
                 .align_y(alignment::Vertical::Center),
             )
@@ -1047,6 +1355,14 @@ fn history(app: &App) -> Element<'_, Message> {
         );
     }
     container(list).max_width(780).into()
+}
+fn scan_status_label(status: ScanStatus) -> &'static str {
+    match status {
+        ScanStatus::Running => "Running",
+        ScanStatus::Completed => "Completed",
+        ScanStatus::Failed => "Failed",
+        ScanStatus::Cancelled => "Cancelled",
+    }
 }
 fn bytes_label(bytes: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -1251,10 +1567,113 @@ mod tests {
     use dupekit_core::GroupId;
     #[test]
     fn parses_human_sizes() {
-        assert_eq!(parse_size("1 MB"), Some(1_048_576));
-        assert_eq!(parse_size("2.5 gb"), Some(2_684_354_560));
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("large"), None);
+        assert_eq!(parse_size_input("1 MB", "Minimum"), Ok(Some(1_048_576)));
+        assert_eq!(
+            parse_size_input("2.5 gb", "Minimum"),
+            Ok(Some(2_684_354_560))
+        );
+        assert_eq!(parse_size_input("", "Minimum"), Ok(None));
+    }
+    #[test]
+    fn rejects_malformed_or_out_of_range_size_inputs() {
+        assert!(parse_size_input("1 MB extra", "Minimum").is_err());
+        assert!(parse_size_input("NaN MB", "Minimum").is_err());
+        assert!(parse_size_input("-1 MB", "Minimum").is_err());
+        assert!(parse_size_input("1 zebibyte", "Minimum").is_err());
+        assert!(parse_size_input("999999999999999999999 TB", "Minimum").is_err());
+        let min = parse_size_input("2 MB", "Minimum").unwrap();
+        let max = parse_size_input("1 MB", "Maximum").unwrap();
+        assert!(min.zip(max).is_some_and(|(min, max)| min > max));
+    }
+    #[test]
+    fn progress_reducer_only_uses_scanner_totals() {
+        let mut progress = ScanProgress::default();
+        progress.apply(&ScanEvent::PhaseStarted {
+            name: "Full hashing".into(),
+            total: Some(100),
+        });
+        progress.apply(&ScanEvent::Progress {
+            processed: 25,
+            total: Some(100),
+        });
+        assert_eq!(progress.phase, "Full hashing");
+        assert_eq!(progress.fraction(), Some(0.25));
+        progress.apply(&ScanEvent::PhaseStarted {
+            name: "Finalizing".into(),
+            total: None,
+        });
+        assert_eq!(progress.fraction(), None);
+    }
+    #[test]
+    fn stale_run_messages_are_rejected() {
+        let mut app = App {
+            screen: Screen::Scanning(ScanProgress::default()),
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: None,
+            scan_events: None,
+            next_scan_run: 2,
+            active_scan_run: Some(2),
+            running_scan_id: None,
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
+            latest_result: None,
+            db: Database::open_in_memory().unwrap(),
+            active_scan_id: None,
+            notice: None,
+        };
+        let task = update(
+            &mut app,
+            Message::ScanCompleted {
+                run: 1,
+                result: Err("old scan".into()),
+            },
+        );
+        drop(task);
+        assert_eq!(app.active_scan_run, Some(2));
+        assert!(matches!(app.screen, Screen::Scanning(_)));
+    }
+
+    #[test]
+    fn stale_cleanup_completion_cannot_change_the_current_screen() {
+        let mut app = App {
+            screen: Screen::Home,
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: None,
+            scan_events: None,
+            next_scan_run: 0,
+            active_scan_run: None,
+            running_scan_id: None,
+            next_cleanup_run: 2,
+            active_cleanup_run: Some(2),
+            latest_result: None,
+            db: Database::open_in_memory().unwrap(),
+            active_scan_id: None,
+            notice: None,
+        };
+        let task = update(
+            &mut app,
+            Message::CleanupCompleted {
+                run: 1,
+                scan_id: None,
+                result: Ok(dupekit_core::CleanupOutcome {
+                    action: CleanupAction::Trash,
+                    removed: vec![],
+                    recovered_bytes: 0,
+                    failures: vec![],
+                }),
+            },
+        );
+        drop(task);
+        assert!(matches!(app.screen, Screen::Home));
+        assert_eq!(app.active_cleanup_run, Some(2));
     }
     #[test]
     fn result_page_is_bounded_for_very_large_scans() {

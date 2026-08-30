@@ -94,6 +94,17 @@ impl CleanupService {
             failures: vec![],
         };
         for file in preflight.plan.files {
+            // The preflight check is only a preview.  A file can be replaced,
+            // modified, or removed while the confirmation dialog is open (or
+            // between two deletes), so check the exact snapshot again at the
+            // last safe point before handing it to the operating system.
+            if let Err(message) = validate_snapshot(&file) {
+                out.failures.push(CleanupFailure {
+                    path: file.path,
+                    message,
+                });
+                continue;
+            }
             match remove(&file.path, preflight.plan.action) {
                 Ok(()) => {
                     out.recovered_bytes += file.size;
@@ -106,6 +117,21 @@ impl CleanupService {
             }
         }
         Ok(out)
+    }
+}
+
+fn validate_snapshot(file: &FileSnapshot) -> Result<(), String> {
+    match fs::metadata(&file.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err("file no longer exists".to_owned())
+        }
+        Err(error) => Err(format!("could not inspect file before cleanup: {error}")),
+        Ok(metadata)
+            if metadata.len() != file.size || metadata.modified().ok() != file.modified =>
+        {
+            Err("file changed since it was scanned".to_owned())
+        }
+        Ok(_) => Ok(()),
     }
 }
 fn snapshot(file: &DuplicateFile) -> FileSnapshot {
@@ -190,5 +216,59 @@ mod tests {
         let out = CleanupService::execute(CleanupService::preflight(plan)).unwrap();
         assert!(!p.exists());
         assert_eq!(out.recovered_bytes, 4);
+    }
+
+    #[test]
+    fn execute_skips_a_file_changed_after_preflight() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("a");
+        fs::write(&p, b"same").unwrap();
+        let plan =
+            CleanupService::plan(&result(p.clone()), CleanupAction::PermanentDelete).unwrap();
+        let preflight = CleanupService::preflight(plan);
+
+        fs::write(&p, b"replacement with a different size").unwrap();
+        let out = CleanupService::execute(preflight).unwrap();
+
+        assert!(p.exists());
+        assert_eq!(out.removed, Vec::<PathBuf>::new());
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].path, p);
+        assert!(out.failures[0].message.contains("changed"));
+    }
+
+    #[test]
+    fn execute_reports_partial_outcomes_and_keeps_unsafe_targets() {
+        let d = tempdir().unwrap();
+        let removed = d.path().join("removed");
+        let changed = d.path().join("changed");
+        fs::write(&removed, b"same").unwrap();
+        fs::write(&changed, b"same").unwrap();
+        let plan = CleanupPlan {
+            action: CleanupAction::PermanentDelete,
+            files: vec![
+                FileSnapshot {
+                    path: removed.clone(),
+                    size: 4,
+                    modified: fs::metadata(&removed).unwrap().modified().ok(),
+                },
+                FileSnapshot {
+                    path: changed.clone(),
+                    size: 4,
+                    modified: fs::metadata(&changed).unwrap().modified().ok(),
+                },
+            ],
+            bytes: 8,
+        };
+        let preflight = CleanupService::preflight(plan);
+        fs::write(&changed, b"changed after preflight").unwrap();
+
+        let out = CleanupService::execute(preflight).unwrap();
+        assert_eq!(out.removed, vec![removed.clone()]);
+        assert_eq!(out.recovered_bytes, 4);
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].path, changed);
+        assert!(!removed.exists());
+        assert!(changed.exists());
     }
 }
