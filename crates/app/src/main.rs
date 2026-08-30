@@ -6,10 +6,13 @@ use dupekit_core::{
 };
 use dupekit_storage::{Database, NewCleanupAction, NewScan, ScanId};
 use iced::widget::{
-    Space, button, checkbox, column, container, horizontal_rule, pick_list, progress_bar, row,
-    scrollable, text, text_input,
+    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input,
 };
-use iced::{Element, Length, Subscription, Task, Theme, alignment, time};
+use iced::{
+    Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector,
+    alignment, time,
+};
 use std::{path::PathBuf, time::Duration};
 
 const GROUPS_PER_PAGE: usize = 12;
@@ -17,8 +20,8 @@ const GROUPS_PER_PAGE: usize = 12;
 fn main() -> iced::Result {
     iced::application("Dupekit", update, view)
         .subscription(subscription)
-        .theme(|_| Theme::TokyoNight)
-        .window_size((1040.0, 760.0))
+        .theme(|_| Theme::Dark)
+        .window_size((1180.0, 800.0))
         .run_with(|| (App::new(), Task::none()))
 }
 
@@ -85,6 +88,7 @@ enum Screen {
         permanent: bool,
         count: usize,
         bytes: u64,
+        acknowledged: bool,
     },
     CleanupDone {
         permanent: bool,
@@ -141,12 +145,14 @@ enum Message {
     Tick,
     CancelScan,
     ToggleFile(DuplicateFileId),
+    DismissNotice,
     ApplyPolicy(UiPolicy),
     PageBack,
     PageForward,
     AskTrash,
     AskDelete,
     CancelConfirm,
+    TogglePermanentAcknowledgement(bool),
     ConfirmCleanup,
     Home,
     OpenHistory,
@@ -297,7 +303,20 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleFile(id) => {
             if let Screen::Results(r) = &mut app.screen {
+                let was_selected = r
+                    .groups
+                    .iter()
+                    .find(|group| group.files.iter().any(|file| file.id == id))
+                    .is_some_and(|group| group.is_selected(id));
                 toggle_file(&mut r.groups, id);
+                let is_selected = r
+                    .groups
+                    .iter()
+                    .find(|group| group.files.iter().any(|file| file.id == id))
+                    .is_some_and(|group| group.is_selected(id));
+                if was_selected && is_selected {
+                    app.notice = Some("Keep at least one copy in each group.".into());
+                }
                 if let Some(group) = r
                     .groups
                     .iter()
@@ -342,6 +361,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     permanent: matches!(message, Message::AskDelete),
                     count,
                     bytes,
+                    acknowledged: false,
                 };
             }
         }
@@ -356,10 +376,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.screen = Screen::Home;
             }
         }
+        Message::TogglePermanentAcknowledgement(value) => {
+            if let Screen::Confirm { acknowledged, .. } = &mut app.screen {
+                *acknowledged = value;
+            }
+        }
         Message::ConfirmCleanup => {
-            if let (Screen::Confirm { permanent, .. }, Some(result)) =
-                (app.screen.clone(), app.latest_result.clone())
+            if let (
+                Screen::Confirm {
+                    permanent,
+                    acknowledged,
+                    ..
+                },
+                Some(result),
+            ) = (app.screen.clone(), app.latest_result.clone())
             {
+                if permanent && !acknowledged {
+                    app.notice = Some("Acknowledge permanent deletion before continuing.".into());
+                    return Task::none();
+                }
                 let action = if permanent {
                     CleanupAction::PermanentDelete
                 } else {
@@ -424,6 +459,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Home => app.screen = Screen::Home,
         Message::OpenHistory => app.screen = Screen::History,
+        Message::DismissNotice => app.notice = None,
         Message::Reopen(id) => {
             if let Ok(groups) = app.db.groups(id) {
                 app.active_scan_id = Some(id);
@@ -506,7 +542,8 @@ fn view(app: &App) -> Element<'_, Message> {
             permanent,
             count,
             bytes,
-        } => confirmation(*permanent, *count, *bytes),
+            acknowledged,
+        } => confirmation(*permanent, *count, *bytes, *acknowledged),
         Screen::CleanupDone {
             permanent,
             count,
@@ -514,66 +551,128 @@ fn view(app: &App) -> Element<'_, Message> {
         } => cleanup_done(*permanent, *count, *bytes),
         Screen::History => history(app),
     };
-    let mut content = column![header()].spacing(18).padding(28);
+    let mut content = column![header()].spacing(24).padding([24, 32]);
     if let Some(notice) = &app.notice {
-        content = content.push(container(text(notice)).padding(12).width(Length::Fill));
+        content = content.push(
+            container(row![
+                text(notice).width(Length::Fill),
+                button("Dismiss")
+                    .style(secondary_button)
+                    .on_press(Message::DismissNotice)
+            ])
+            .padding(12)
+            .width(Length::Fill)
+            .style(alert_style),
+        );
     }
-    container(content.push(body))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    container(
+        container(content.push(body))
+            .max_width(1180)
+            .center_x(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(Background::Color(BG)),
+        text_color: Some(TEXT),
+        ..container::Style::default()
+    })
+    .into()
 }
 fn header() -> Element<'static, Message> {
-    row![
-        column![
-            text("dupekit").size(28),
-            text("safe duplicate cleanup").size(13)
-        ],
-        Space::with_width(Length::Fill),
-        button("History").on_press(Message::OpenHistory),
-        button("New scan").on_press(Message::Home)
-    ]
-    .align_y(alignment::Vertical::Center)
+    container(
+        row![
+            column![
+                text("dupekit").size(24),
+                text("SAFE DUPLICATE CLEANUP").size(11).color(MUTED)
+            ]
+            .spacing(2),
+            Space::with_width(Length::Fill),
+            button("New scan")
+                .style(secondary_button)
+                .on_press(Message::Home),
+            button("History")
+                .style(secondary_button)
+                .on_press(Message::OpenHistory)
+        ]
+        .spacing(8)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding([0, 14])
     .into()
 }
 fn home(app: &App) -> Element<'_, Message> {
     let mut dirs = column![
-        text("Directories").size(22),
-        text("Add folders to compare. Preferred folders are kept by default.").size(14)
+        text("Scan locations").size(18),
+        text("Add folders to compare. Files in preferred locations are kept by default.")
+            .size(14)
+            .color(MUTED)
     ]
-    .spacing(10);
+    .spacing(8);
     if app.paths.is_empty() {
         dirs = dirs.push(
-            container(text("No folders selected yet").size(16))
-                .padding(22)
-                .width(Length::Fill),
+            container(
+                column![
+                    text("No locations added").size(16),
+                    text("Choose one or more folders to start a safe duplicate scan.")
+                        .size(13)
+                        .color(MUTED)
+                ]
+                .spacing(5),
+            )
+            .padding(20)
+            .width(Length::Fill)
+            .style(raised_style),
         );
     }
     for (i, entry) in app.paths.iter().enumerate() {
         dirs = dirs.push(
-            row![
-                checkbox("Preferred", entry.preferred)
-                    .on_toggle(move |_| Message::TogglePreferred(i))
-                    .width(110),
-                text(entry.path.to_string_lossy()).width(Length::Fill),
-                button("Remove").on_press(Message::RemovePath(i))
-            ]
-            .align_y(alignment::Vertical::Center)
-            .spacing(12),
+            container(
+                row![
+                    checkbox("Keep files here by default", entry.preferred)
+                        .on_toggle(move |_| Message::TogglePreferred(i))
+                        .width(220),
+                    text(entry.path.to_string_lossy())
+                        .size(15)
+                        .width(Length::Fill),
+                    button("Remove")
+                        .style(secondary_button)
+                        .on_press(Message::RemovePath(i))
+                ]
+                .align_y(alignment::Vertical::Center)
+                .spacing(12),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(card_style),
         );
     }
-    dirs = dirs.push(button("+ Add directory").on_press(Message::AddDirectory));
+    dirs = dirs.push(
+        button("Add folder")
+            .style(secondary_button)
+            .padding([10, 14])
+            .on_press(Message::AddDirectory),
+    );
     let options = column![
-        text("Scan options").size(22),
+        text("Scan settings").size(18),
+        text("Limit the files included in this scan.")
+            .size(13)
+            .color(MUTED),
         row![
             column![
-                text("Minimum file size"),
-                text_input("e.g. 1 MB", &app.min_size).on_input(Message::MinSize)
-            ],
-            column![
-                text("Maximum file size (optional)"),
-                text_input("No limit", &app.max_size).on_input(Message::MaxSize)
+                text("Minimum file size").size(13).color(MUTED),
+                text_input("e.g. 1 MB", &app.min_size)
+                    .on_input(Message::MinSize)
+                    .padding(10)
             ]
+            .width(Length::Fill),
+            column![
+                text("Maximum file size (optional)").size(13).color(MUTED),
+                text_input("No limit", &app.max_size)
+                    .on_input(Message::MaxSize)
+                    .padding(10)
+            ]
+            .width(Length::Fill)
         ]
         .spacing(22),
         checkbox("Use fclones hash cache", app.cache).on_toggle(Message::ToggleCache),
@@ -581,17 +680,22 @@ fn home(app: &App) -> Element<'_, Message> {
             "fclones manages its own cache; Dupekit never duplicates file hashes in its database."
         )
         .size(13)
+        .color(MUTED)
     ]
-    .spacing(10);
+    .spacing(10)
+    .padding(18);
     column![
-        dirs,
-        horizontal_rule(1),
-        options,
-        Space::with_height(Length::Fill),
+        text("Find duplicate files").size(30),
+        text("Review matching files, choose what to remove, and always keep at least one copy.")
+            .size(15)
+            .color(MUTED),
+        container(dirs.padding(18)).style(card_style),
+        container(options).style(card_style),
         row![
             Space::with_width(Length::Fill),
             button(text("Find duplicates").size(17))
                 .padding([12, 22])
+                .style(primary_button)
                 .on_press_maybe((!app.paths.is_empty()).then_some(Message::StartScan))
         ]
     ]
@@ -606,8 +710,8 @@ fn scanning(progress: f32, phase: usize) -> Element<'static, Message> {
         "Full hashing",
     ];
     let mut body = column![
-        text("Scanning your folders").size(28),
-        text("Dupekit is working in the background. You can cancel safely at any time.").size(15),
+        text("Scanning locations").size(30),
+        text("Preparing a safe comparison. Progress phases are activity indicators, not an exact percentage.").size(15).color(MUTED),
         Space::with_height(20)
     ]
     .spacing(12);
@@ -618,10 +722,11 @@ fn scanning(progress: f32, phase: usize) -> Element<'static, Message> {
                 text(if i < phase {
                     "Complete"
                 } else if i == phase {
-                    "Working"
+                    "Working…"
                 } else {
                     "Waiting"
                 })
+                .color(if i < phase { SUCCESS } else { MUTED })
             ])
             .push(progress_bar(
                 0.0..=1.0,
@@ -636,13 +741,20 @@ fn scanning(progress: f32, phase: usize) -> Element<'static, Message> {
     }
     body = body
         .push(Space::with_height(24))
-        .push(text(format!("{:.0}% complete", progress * 100.0)).size(18))
+        .push(
+            text("Scanning continues until fclones finishes comparing files.")
+                .size(13)
+                .color(MUTED),
+        )
         .push(Space::with_height(Length::Fill))
         .push(row![
             Space::with_width(Length::Fill),
-            button("Cancel scan").on_press(Message::CancelScan)
+            button("Cancel scan")
+                .style(secondary_button)
+                .on_press(Message::CancelScan)
         ]);
-    container(body)
+    container(body.padding(28))
+        .style(raised_style)
         .max_width(680)
         .center_x(Length::Fill)
         .height(Length::Fill)
@@ -665,29 +777,47 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
     column![
         row![
             column![
-                text("Duplicates found").size(28),
-                text(&results.scan_name).size(14)
+                text("Review duplicates").size(30),
+                text(format!(
+                    "{} · Select files to remove; one copy is always kept.",
+                    results.scan_name
+                ))
+                .size(14)
+                .color(MUTED)
             ],
             Space::with_width(Length::Fill),
             column![
-                text(format!("{} selected · {}", count, bytes_label(bytes)))
+                text("SELECTED").size(11).color(MUTED),
+                text(format!("{} files · {}", count, bytes_label(bytes)))
                     .align_x(alignment::Horizontal::Right),
-                text(format!("{} recoverable", bytes_label(potential)))
-                    .align_x(alignment::Horizontal::Right)
+                text(format!(
+                    "{} potentially reclaimable",
+                    bytes_label(potential)
+                ))
+                .size(12)
+                .color(MUTED)
+                .align_x(alignment::Horizontal::Right)
             ]
         ],
-        row![
-            text(format!(
-                "{} groups · {} files",
-                results.groups.len(),
-                results.groups.iter().map(|g| g.files.len()).sum::<usize>()
-            ))
-            .width(Length::Fill),
-            pick_list(&UiPolicy::ALL[..], None::<UiPolicy>, Message::ApplyPolicy)
-                .placeholder("Select duplicates…")
-        ]
-        .align_y(alignment::Vertical::Center),
-        horizontal_rule(1),
+        container(
+            row![
+                text(format!(
+                    "{} groups · {} files",
+                    results.groups.len(),
+                    results.groups.iter().map(|g| g.files.len()).sum::<usize>()
+                ))
+                .size(14)
+                .color(MUTED)
+                .width(Length::Fill),
+                text("Automatic selection").size(13).color(MUTED),
+                pick_list(&UiPolicy::ALL[..], None::<UiPolicy>, Message::ApplyPolicy)
+                    .placeholder("Select duplicates")
+            ]
+            .align_y(alignment::Vertical::Center)
+            .spacing(12)
+        )
+        .padding(12)
+        .style(card_style),
         scrollable(groups).height(Length::Fill),
         row![
             button("‹ Previous").on_press_maybe((results.page > 0).then_some(Message::PageBack)),
@@ -702,13 +832,30 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
             button("Next ›")
                 .on_press_maybe((end < results.groups.len()).then_some(Message::PageForward))
         ],
-        row![
-            button("Permanently delete…").on_press_maybe((count > 0).then_some(Message::AskDelete)),
-            Space::with_width(Length::Fill),
-            button("Move selected to Trash")
-                .on_press_maybe((count > 0).then_some(Message::AskTrash))
-        ]
-        .align_y(alignment::Vertical::Center)
+        container(
+            row![
+                column![
+                    text("READY TO CLEAN UP").size(11).color(MUTED),
+                    text(format!(
+                        "{} selected · {} recoverable",
+                        count,
+                        bytes_label(bytes)
+                    ))
+                    .size(15)
+                ],
+                Space::with_width(Length::Fill),
+                button("Permanently delete…")
+                    .style(danger_button)
+                    .on_press_maybe((count > 0).then_some(Message::AskDelete)),
+                button("Move selected to Trash")
+                    .style(primary_button)
+                    .on_press_maybe((count > 0).then_some(Message::AskTrash))
+            ]
+            .align_y(alignment::Vertical::Center)
+            .spacing(10)
+        )
+        .padding(14)
+        .style(raised_style)
     ]
     .spacing(14)
     .height(Length::Fill)
@@ -716,69 +863,107 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
 }
 fn group_view(g: &DuplicateGroup) -> Element<'_, Message> {
     let mut body = column![row![
-        text(format!("{} copies", g.files.len())).size(17),
+        text(format!("{} matching files", g.files.len())).size(16),
         Space::with_width(Length::Fill),
-        text(format!("{} each", bytes_label(g.file_size))).size(14)
+        text(format!("{} each", bytes_label(g.file_size)))
+            .size(13)
+            .color(MUTED)
     ]]
     .spacing(7);
     for f in &g.files {
         let id = f.id;
+        let selected = g.is_selected(id);
+        let kept = !selected && g.selected_ids().len() == g.files.len() - 1;
         body = body.push(
-            row![
-                checkbox("", g.is_selected(id)).on_toggle(move |_| Message::ToggleFile(id)),
-                column![
-                    text(f.path.to_string_lossy()).size(15),
-                    text(format!(
-                        "{} · modified {}",
-                        bytes_label(g.file_size),
-                        modified_label(f)
-                    ))
-                    .size(12)
+            button(
+                row![
+                    text(if selected { "☑" } else { "☐" })
+                        .size(20)
+                        .color(if selected { BLUE } else { MUTED }),
+                    column![
+                        text(f.path.to_string_lossy()).size(15),
+                        text(format!(
+                            "{} · modified {}",
+                            bytes_label(g.file_size),
+                            modified_label(f)
+                        ))
+                        .size(12)
+                        .color(MUTED)
+                    ]
+                    .width(Length::Fill),
+                    text(if kept { "KEPT" } else { "" }).size(11).color(SUCCESS)
                 ]
-                .width(Length::Fill)
-            ]
-            .align_y(alignment::Vertical::Center),
+                .align_y(alignment::Vertical::Center)
+                .spacing(12),
+            )
+            .width(Length::Fill)
+            .padding([10, 12])
+            .style(row_button(selected))
+            .on_press(Message::ToggleFile(id)),
         );
     }
-    container(body.padding(14)).width(Length::Fill).into()
+    container(body.padding(14))
+        .width(Length::Fill)
+        .style(card_style)
+        .into()
 }
-fn confirmation(permanent: bool, count: usize, bytes: u64) -> Element<'static, Message> {
+fn confirmation(
+    permanent: bool,
+    count: usize,
+    bytes: u64,
+    acknowledged: bool,
+) -> Element<'static, Message> {
     let action = if permanent {
         "Permanently delete"
     } else {
         "Move to Trash"
     };
-    container(
-        column![
-            text(format!("{} {} files?", action, count)).size(27),
-            text(format!(
-                "This will affect approximately {}.{}",
-                bytes_label(bytes),
-                if permanent {
-                    " This cannot be undone."
-                } else {
-                    " A preflight check runs first."
-                }
-            )),
-            text(if permanent {
-                "Permanent deletion is irreversible. Review your selection."
-            } else {
-                "Files remain recoverable until the system trash is emptied."
-            })
-            .size(14),
-            row![
-                button("Cancel").on_press(Message::CancelConfirm),
-                Space::with_width(Length::Fill),
-                button(action).on_press(Message::ConfirmCleanup)
-            ]
-        ]
-        .spacing(18)
-        .padding(28),
-    )
-    .max_width(610)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .into()
+    let mut content = column![
+        text(format!("{} {} files?", action, count)).size(28),
+        text(format!(
+            "{} will be affected, recovering approximately {}.",
+            count,
+            bytes_label(bytes)
+        ))
+        .color(MUTED),
+        text(if permanent {
+            "This action is irreversible. Files will not be sent to your system Trash."
+        } else {
+            "Files remain recoverable until the system Trash is emptied."
+        })
+        .size(14),
+    ]
+    .spacing(16);
+    if permanent {
+        content = content.push(
+            checkbox("I understand these files cannot be recovered", acknowledged)
+                .on_toggle(Message::TogglePermanentAcknowledgement),
+        );
+    }
+    let action_button: Element<'static, Message> = if permanent {
+        button(action)
+            .style(danger_button)
+            .on_press_maybe(acknowledged.then_some(Message::ConfirmCleanup))
+            .into()
+    } else {
+        button(action)
+            .style(primary_button)
+            .on_press(Message::ConfirmCleanup)
+            .into()
+    };
+    content = content.push(row![
+        button("Cancel")
+            .style(secondary_button)
+            .on_press(Message::CancelConfirm),
+        Space::with_width(Length::Fill),
+        action_button
+    ]);
+    container(content.padding(28))
+        .max_width(610)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(if permanent { alert_style } else { raised_style })
+        .into()
 }
 fn cleanup_done(permanent: bool, count: usize, bytes: u64) -> Element<'static, Message> {
     container(
@@ -795,38 +980,70 @@ fn cleanup_done(permanent: bool, count: usize, bytes: u64) -> Element<'static, M
                 bytes_label(bytes)
             )),
             text("Filesystem failures are recorded in scan history.").size(14),
-            button("Back to home").on_press(Message::Home)
+            row![
+                button("New scan")
+                    .style(secondary_button)
+                    .on_press(Message::Home),
+                button("Review results")
+                    .style(primary_button)
+                    .on_press(Message::CancelConfirm)
+            ]
+            .spacing(10)
         ]
         .spacing(16)
         .padding(28),
     )
     .center_x(Length::Fill)
     .center_y(Length::Fill)
+    .style(raised_style)
     .into()
 }
 fn history(app: &App) -> Element<'_, Message> {
     let mut list = column![
-        text("Scan history").size(28),
-        text("Reopen a completed scan to review its duplicate groups.").size(14)
+        text("Scan history").size(30),
+        text("Reopen a saved scan to review its duplicate groups.")
+            .size(14)
+            .color(MUTED)
     ]
     .spacing(14);
     for scan in &app.history {
         list = list.push(
-            row![
-                column![
-                    text(&scan.name).size(17),
-                    text(format!(
-                        "{} · {} groups · {} recoverable",
-                        scan.date,
-                        scan.groups,
-                        bytes_label(scan.bytes)
-                    ))
-                    .size(13)
+            container(
+                row![
+                    column![
+                        text(&scan.name).size(17),
+                        text(format!(
+                            "{} · {} groups · {} recoverable",
+                            scan.date,
+                            scan.groups,
+                            bytes_label(scan.bytes)
+                        ))
+                        .size(13)
+                    ]
+                    .width(Length::Fill),
+                    button("Open results")
+                        .style(secondary_button)
+                        .on_press(Message::Reopen(scan.id))
                 ]
-                .width(Length::Fill),
-                button("Reopen").on_press(Message::Reopen(scan.id))
-            ]
-            .align_y(alignment::Vertical::Center),
+                .align_y(alignment::Vertical::Center),
+            )
+            .padding(14)
+            .style(card_style),
+        );
+    }
+    if app.history.is_empty() {
+        list = list.push(
+            container(
+                column![
+                    text("No saved scans").size(17),
+                    text("Completed scans will appear here.")
+                        .size(13)
+                        .color(MUTED)
+                ]
+                .spacing(6),
+            )
+            .padding(22)
+            .style(card_style),
         );
     }
     container(list).max_width(780).into()
@@ -851,9 +1068,187 @@ fn modified_label(file: &DuplicateFile) -> String {
         .unwrap_or_else(|| "unknown date".into())
 }
 
+// A small, deliberately restrained visual system. Keeping it local means the
+// application can remain a single native binary without a web-style asset layer.
+const BG: Color = Color {
+    r: 0.063,
+    g: 0.078,
+    b: 0.094,
+    a: 1.0,
+};
+const SURFACE: Color = Color {
+    r: 0.094,
+    g: 0.129,
+    b: 0.176,
+    a: 1.0,
+};
+const RAISED: Color = Color {
+    r: 0.125,
+    g: 0.169,
+    b: 0.220,
+    a: 1.0,
+};
+const BORDER: Color = Color {
+    r: 0.173,
+    g: 0.227,
+    b: 0.290,
+    a: 1.0,
+};
+const TEXT: Color = Color {
+    r: 0.929,
+    g: 0.949,
+    b: 0.969,
+    a: 1.0,
+};
+const MUTED: Color = Color {
+    r: 0.576,
+    g: 0.643,
+    b: 0.722,
+    a: 1.0,
+};
+const BLUE: Color = Color {
+    r: 0.310,
+    g: 0.549,
+    b: 1.0,
+    a: 1.0,
+};
+const BLUE_HOVER: Color = Color {
+    r: 0.439,
+    g: 0.639,
+    b: 1.0,
+    a: 1.0,
+};
+const DANGER: Color = Color {
+    r: 0.875,
+    g: 0.396,
+    b: 0.439,
+    a: 1.0,
+};
+const SUCCESS: Color = Color {
+    r: 0.200,
+    g: 0.710,
+    b: 0.553,
+    a: 1.0,
+};
+
+fn card_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE)),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+fn raised_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(RAISED)),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.25,
+                ..Color::BLACK
+            },
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 14.0,
+        },
+    }
+}
+fn alert_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(55, 35, 40))),
+        text_color: Some(TEXT),
+        border: Border {
+            color: DANGER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+fn primary_button(_: &Theme, status: button::Status) -> button::Style {
+    let color = match status {
+        button::Status::Hovered => BLUE_HOVER,
+        button::Status::Pressed => Color::from_rgb8(58, 112, 220),
+        button::Status::Disabled => Color::from_rgb8(54, 75, 105),
+        _ => BLUE,
+    };
+    button::Style {
+        background: Some(Background::Color(color)),
+        text_color: TEXT,
+        border: Border {
+            color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = matches!(status, button::Status::Hovered).then_some(Background::Color(RAISED));
+    button::Style {
+        background,
+        text_color: if matches!(status, button::Status::Disabled) {
+            MUTED
+        } else {
+            TEXT
+        },
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+fn danger_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = matches!(status, button::Status::Hovered)
+        .then_some(Background::Color(Color::from_rgb8(78, 42, 48)));
+    button::Style {
+        background,
+        text_color: DANGER,
+        border: Border {
+            color: DANGER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+fn row_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let background = if selected {
+            Color::from_rgb8(31, 54, 83)
+        } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+            RAISED
+        } else {
+            SURFACE
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: TEXT,
+            border: Border {
+                color: if selected { BLUE } else { BORDER },
+                width: 1.0,
+                radius: 7.0.into(),
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dupekit_core::GroupId;
     #[test]
     fn parses_human_sizes() {
         assert_eq!(parse_size("1 MB"), Some(1_048_576));
@@ -869,5 +1264,37 @@ mod tests {
         let end = (start + GROUPS_PER_PAGE).min(total_groups);
         assert!(end - start <= GROUPS_PER_PAGE);
         assert_eq!(GROUPS_PER_PAGE, 12);
+    }
+
+    #[test]
+    fn file_row_toggle_preserves_a_copy_in_its_group() {
+        let first = DuplicateFileId(1);
+        let second = DuplicateFileId(2);
+        let group = DuplicateGroup::new(
+            GroupId(1),
+            42,
+            vec![
+                DuplicateFile {
+                    id: first,
+                    path: "first".into(),
+                    size: 42,
+                    modified: None,
+                },
+                DuplicateFile {
+                    id: second,
+                    path: "second".into(),
+                    size: 42,
+                    modified: None,
+                },
+            ],
+        )
+        .unwrap();
+        let mut groups = vec![group];
+        toggle_file(&mut groups, first);
+        assert!(groups[0].is_selected(first));
+        // Selecting the other row would select every copy, so the core rejects it.
+        toggle_file(&mut groups, second);
+        assert!(groups[0].is_selected(first));
+        assert!(!groups[0].is_selected(second));
     }
 }
