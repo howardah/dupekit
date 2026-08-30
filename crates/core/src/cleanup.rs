@@ -36,6 +36,18 @@ pub struct CleanupOutcome {
     pub recovered_bytes: u64,
     pub failures: Vec<CleanupFailure>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupProgressPhase {
+    Checking,
+    Removing,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupProgressUpdate {
+    pub phase: CleanupProgressPhase,
+    pub processed: usize,
+    pub total: usize,
+    pub path: PathBuf,
+}
 #[derive(Debug, thiserror::Error)]
 pub enum CleanupError {
     #[error("invalid duplicate selection: {0}")]
@@ -87,6 +99,14 @@ impl CleanupService {
         preflight: CleanupPreflight,
         mut progress: impl FnMut(usize, usize, &std::path::Path),
     ) -> Result<CleanupOutcome, CleanupError> {
+        Self::execute_with_updates(preflight, |update| {
+            progress(update.processed, update.total, &update.path);
+        })
+    }
+    pub fn execute_with_updates(
+        preflight: CleanupPreflight,
+        mut progress: impl FnMut(CleanupProgressUpdate),
+    ) -> Result<CleanupOutcome, CleanupError> {
         if !preflight.missing.is_empty() || !preflight.changed.is_empty() {
             return Err(CleanupError::UnsafePreflight {
                 missing: preflight.missing.len(),
@@ -100,6 +120,8 @@ impl CleanupService {
             failures: vec![],
         };
         let total = preflight.plan.files.len();
+        let action = preflight.plan.action;
+        let mut ready = Vec::with_capacity(total);
         for (index, file) in preflight.plan.files.into_iter().enumerate() {
             let path = file.path.clone();
             // The preflight check is only a preview.  A file can be replaced,
@@ -111,10 +133,25 @@ impl CleanupService {
                     path: file.path,
                     message,
                 });
-                progress(index + 1, total, &path);
+                progress(CleanupProgressUpdate {
+                    phase: CleanupProgressPhase::Checking,
+                    processed: index + 1,
+                    total,
+                    path,
+                });
                 continue;
             }
-            match remove(&file.path, preflight.plan.action) {
+            if action == CleanupAction::Trash {
+                ready.push(file);
+                progress(CleanupProgressUpdate {
+                    phase: CleanupProgressPhase::Checking,
+                    processed: index + 1,
+                    total,
+                    path,
+                });
+                continue;
+            }
+            match remove(&file.path, action) {
                 Ok(()) => {
                     out.recovered_bytes += file.size;
                     out.removed.push(file.path)
@@ -124,7 +161,38 @@ impl CleanupService {
                     message: error.to_string(),
                 }),
             }
-            progress(index + 1, total, &path);
+            progress(CleanupProgressUpdate {
+                phase: CleanupProgressPhase::Removing,
+                processed: index + 1,
+                total,
+                path,
+            });
+        }
+        if action == CleanupAction::Trash && !ready.is_empty() {
+            match trash::delete_all(ready.iter().map(|file| &file.path)) {
+                Ok(()) => {
+                    for file in ready {
+                        let path = file.path.clone();
+                        out.recovered_bytes += file.size;
+                        out.removed.push(file.path);
+                        progress(CleanupProgressUpdate {
+                            phase: CleanupProgressPhase::Removing,
+                            processed: out.removed.len() + out.failures.len(),
+                            total,
+                            path,
+                        });
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    for file in ready {
+                        out.failures.push(CleanupFailure {
+                            path: file.path,
+                            message: message.clone(),
+                        });
+                    }
+                }
+            }
         }
         Ok(out)
     }

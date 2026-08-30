@@ -1,8 +1,8 @@
 //! Native Iced MVP. Results are paged, so the widget tree remains bounded.
 use dupekit_core::{
-    CancellationToken, CleanupAction, CleanupService, DuplicateFile, DuplicateFileId,
-    DuplicateGroup, DuplicateScanner, FclonesScanner, ScanConfig, ScanEvent, ScanPath, ScanResult,
-    SelectionPolicy as CoreSelectionPolicy,
+    CancellationToken, CleanupAction, CleanupProgressPhase, CleanupService, DuplicateFile,
+    DuplicateFileId, DuplicateGroup, DuplicateScanner, FclonesScanner, ScanConfig, ScanEvent,
+    ScanPath, ScanResult, SelectionPolicy as CoreSelectionPolicy,
 };
 use dupekit_storage::{Database, NewScan, ScanId, ScanSettings, ScanStatus};
 use iced::widget::{
@@ -178,6 +178,7 @@ struct ScanProgress {
 #[derive(Debug, Clone)]
 struct CleanupProgress {
     action: CleanupAction,
+    phase: CleanupProgressPhase,
     processed: usize,
     total: usize,
     current: Option<PathBuf>,
@@ -185,6 +186,7 @@ struct CleanupProgress {
 
 #[derive(Debug)]
 struct CleanupProgressEvent {
+    phase: CleanupProgressPhase,
     processed: usize,
     total: usize,
     path: PathBuf,
@@ -653,6 +655,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 while let Ok(event) = receiver.try_recv() {
                     progress.processed = event.processed;
                     progress.total = event.total;
+                    progress.phase = event.phase;
                     progress.current = Some(event.path);
                 }
             }
@@ -836,6 +839,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.cleanup_events = Some(progress_receiver);
                 app.screen = Screen::Cleaning(CleanupProgress {
                     action,
+                    phase: CleanupProgressPhase::Checking,
                     processed: 0,
                     total,
                     current: None,
@@ -845,16 +849,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         let preflight = CleanupService::preflight(plan);
                         let result = if preflight.missing.is_empty() && preflight.changed.is_empty()
                         {
-                            CleanupService::execute_with_progress(
-                                preflight,
-                                |processed, total, path| {
-                                    let _ = progress_sender.send(CleanupProgressEvent {
-                                        processed,
-                                        total,
-                                        path: path.to_path_buf(),
-                                    });
-                                },
-                            )
+                            CleanupService::execute_with_updates(preflight, |update| {
+                                let _ = progress_sender.send(CleanupProgressEvent {
+                                    phase: update.phase,
+                                    processed: update.processed,
+                                    total: update.total,
+                                    path: update.path,
+                                });
+                            })
                             .map_err(|error| error.to_string())
                         } else {
                             Err(preflight_failure_message(&preflight))
@@ -1575,15 +1577,26 @@ fn cleaning(progress: &CleanupProgress) -> Element<'static, Message> {
     container(
         column![
             text(action).size(30),
-            text(format!(
-                "{} of {} files processed",
-                progress.processed, progress.total
-            )),
+            text(if progress.phase == CleanupProgressPhase::Checking {
+                format!(
+                    "Preparing {} of {} files",
+                    progress.processed, progress.total
+                )
+            } else {
+                format!(
+                    "{} of {} files processed",
+                    progress.processed, progress.total
+                )
+            }),
             progress_bar(0.0..=1.0, fraction),
             text(current).size(13).color(MUTED),
-            text("The remaining files are rechecked immediately before each operation.")
-                .size(13)
-                .color(MUTED)
+            text(if progress.phase == CleanupProgressPhase::Checking {
+                "Checking selected files before moving them together."
+            } else {
+                "The selected files are being moved to the system Trash."
+            })
+            .size(13)
+            .color(MUTED)
         ]
         .spacing(14)
         .padding(28),

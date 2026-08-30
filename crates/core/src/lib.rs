@@ -10,7 +10,7 @@ mod scanner;
 
 pub use cleanup::{
     CleanupAction, CleanupError, CleanupFailure, CleanupOutcome, CleanupPlan, CleanupPreflight,
-    CleanupService, FileSnapshot,
+    CleanupProgressPhase, CleanupProgressUpdate, CleanupService, FileSnapshot,
 };
 pub use models::{
     DuplicateFile, DuplicateFileId, DuplicateGroup, GroupId, ScanConfig, ScanPath, ScanResult,
