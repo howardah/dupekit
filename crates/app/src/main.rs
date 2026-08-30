@@ -6,8 +6,8 @@ use dupekit_core::{
 };
 use dupekit_storage::{Database, NewScan, ScanId, ScanStatus};
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
-    text_input,
+    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, stack,
+    text, text_input,
 };
 use iced::{
     Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector,
@@ -102,6 +102,7 @@ enum Screen {
         bytes: u64,
         acknowledged: bool,
     },
+    Cleaning(CleanupProgress),
     CleanupDone {
         permanent: bool,
         count: usize,
@@ -118,6 +119,21 @@ struct ScanProgress {
     processed: u64,
     total: Option<u64>,
     pulse: f32,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupProgress {
+    action: CleanupAction,
+    processed: usize,
+    total: usize,
+    current: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct CleanupProgressEvent {
+    processed: usize,
+    total: usize,
+    path: PathBuf,
 }
 
 impl Default for ScanProgress {
@@ -188,6 +204,7 @@ struct App {
     scan_mode: Option<ScanMode>,
     next_cleanup_run: u64,
     active_cleanup_run: Option<u64>,
+    cleanup_events: Option<Receiver<CleanupProgressEvent>>,
     latest_result: Option<ScanResult>,
     db: Database,
     active_scan_id: Option<ScanId>,
@@ -213,6 +230,7 @@ impl App {
             scan_mode: None,
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db,
             active_scan_id: None,
@@ -263,7 +281,9 @@ enum Message {
 
 fn subscription(app: &App) -> Subscription<Message> {
     match app.screen {
-        Screen::Scanning(_) => time::every(Duration::from_millis(80)).map(|_| Message::Tick),
+        Screen::Scanning(_) | Screen::Cleaning(_) => {
+            time::every(Duration::from_millis(80)).map(|_| Message::Tick)
+        }
         _ => Subscription::none(),
     }
 }
@@ -530,6 +550,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 // The pulse communicates ongoing work only when fclones did
                 // not provide a total; it is never presented as completion.
                 progress.pulse = (progress.pulse + 0.08) % 1.0;
+            } else if let Screen::Cleaning(progress) = &mut app.screen
+                && let Some(receiver) = &app.cleanup_events
+            {
+                while let Ok(event) = receiver.try_recv() {
+                    progress.processed = event.processed;
+                    progress.total = event.total;
+                    progress.current = Some(event.path);
+                }
             }
         }
         Message::CancelScan => {
@@ -701,13 +729,42 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.next_cleanup_run = app.next_cleanup_run.wrapping_add(1);
                 let run = app.next_cleanup_run;
                 let scan_id = app.active_scan_id;
+                let plan = match CleanupService::plan(&result, action) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        app.notice = Some(format!("Cleanup could not start: {error}"));
+                        return Task::none();
+                    }
+                };
+                let total = plan.files.len();
+                let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
                 app.active_cleanup_run = Some(run);
+                app.cleanup_events = Some(progress_receiver);
+                app.screen = Screen::Cleaning(CleanupProgress {
+                    action,
+                    processed: 0,
+                    total,
+                    current: None,
+                });
                 return Task::perform(
                     async move {
-                        let result = CleanupService::plan(&result, action)
-                            .map(CleanupService::preflight)
-                            .and_then(CleanupService::execute)
-                            .map_err(|error| error.to_string());
+                        let preflight = CleanupService::preflight(plan);
+                        let result = if preflight.missing.is_empty() && preflight.changed.is_empty()
+                        {
+                            CleanupService::execute_with_progress(
+                                preflight,
+                                |processed, total, path| {
+                                    let _ = progress_sender.send(CleanupProgressEvent {
+                                        processed,
+                                        total,
+                                        path: path.to_path_buf(),
+                                    });
+                                },
+                            )
+                            .map_err(|error| error.to_string())
+                        } else {
+                            Err(preflight_failure_message(&preflight))
+                        };
                         Message::CleanupCompleted {
                             run,
                             scan_id,
@@ -727,6 +784,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             app.active_cleanup_run = None;
+            app.cleanup_events = None;
             if let Some(scan_id) = scan_id {
                 let action_name = if outcome.action == CleanupAction::Trash {
                     "trash"
@@ -767,7 +825,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Do not pull a user away from a screen they navigated to while
             // cleanup was running; the audit above still belongs to the scan
             // that initiated the operation.
-            if matches!(app.screen, Screen::Confirm { .. }) {
+            if matches!(app.screen, Screen::Cleaning(_)) {
                 app.screen = Screen::CleanupDone {
                     permanent: outcome.action == CleanupAction::PermanentDelete,
                     count: outcome.removed.len(),
@@ -803,7 +861,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             app.active_cleanup_run = None;
-            app.notice = Some(format!("Cleanup was not performed: {error}"));
+            app.cleanup_events = None;
+            app.notice = Some(error);
             if let Some(result) = &app.latest_result {
                 app.screen = Screen::Results(ScanResults {
                     groups: result.groups.clone(),
@@ -815,18 +874,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::Home => {
-            if !app.scan_worker_active() {
+            if !app.scan_worker_active() && app.active_cleanup_run.is_none() {
                 app.screen = Screen::Home;
             }
         }
         Message::OpenHistory => {
-            if !app.scan_worker_active() {
+            if !app.scan_worker_active() && app.active_cleanup_run.is_none() {
                 app.screen = Screen::History;
             }
         }
         Message::DismissNotice => app.notice = None,
         Message::Reopen(id) => {
-            if app.scan_worker_active() {
+            if app.scan_worker_active() || app.active_cleanup_run.is_some() {
                 return Task::none();
             }
             match app.db.scan(id) {
@@ -988,6 +1047,36 @@ fn append_notice(app: &mut App, message: String) {
         app.notice = Some(message);
     }
 }
+fn preflight_failure_message(preflight: &dupekit_core::CleanupPreflight) -> String {
+    fn describe(label: &str, paths: &[PathBuf]) -> Option<String> {
+        (!paths.is_empty()).then(|| {
+            let shown = paths
+                .iter()
+                .take(4)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remainder = paths.len().saturating_sub(4);
+            if remainder == 0 {
+                format!("{label}: {shown}")
+            } else {
+                format!("{label}: {shown}, and {remainder} more")
+            }
+        })
+    }
+
+    let details = [
+        describe("Missing", &preflight.missing),
+        describe("Changed", &preflight.changed),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(". ");
+    format!(
+        "Cleanup stopped before removing any files because the selected files no longer match the scan. {details}. Refresh the results and review the selection; if this repeats, another application may be updating those files."
+    )
+}
 fn history_items(db: &Database) -> Result<Vec<HistoryItem>, dupekit_storage::StorageError> {
     Ok(db
         .scans()?
@@ -1050,7 +1139,10 @@ fn parse_size_input(value: &str, field: &str) -> Result<Option<u64>, String> {
 fn view(app: &App) -> Element<'_, Message> {
     let body = match &app.screen {
         Screen::Home => home(app),
-        Screen::Scanning(progress) => scanning(progress),
+        Screen::Scanning(progress) => match &app.scan_mode {
+            Some(ScanMode::Refresh { previous, .. }) => refreshing(previous, progress),
+            _ => scanning(progress),
+        },
         Screen::Cancelling => cancelling(),
         Screen::Results(r) => results(r),
         Screen::Confirm {
@@ -1059,6 +1151,7 @@ fn view(app: &App) -> Element<'_, Message> {
             bytes,
             acknowledged,
         } => confirmation(*permanent, *count, *bytes, *acknowledged),
+        Screen::Cleaning(progress) => cleaning(progress),
         Screen::CleanupDone {
             permanent,
             count,
@@ -1095,7 +1188,7 @@ fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 fn header(app: &App) -> Element<'static, Message> {
-    let available = !app.scan_worker_active();
+    let available = !app.scan_worker_active() && app.active_cleanup_run.is_none();
     container(
         row![
             column![
@@ -1287,6 +1380,89 @@ fn scanning(progress: &ScanProgress) -> Element<'static, Message> {
         .center_x(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+fn refreshing<'a>(previous: &'a ScanResults, progress: &ScanProgress) -> Element<'a, Message> {
+    let (value, detail) = match progress.fraction() {
+        Some(fraction) => (
+            fraction,
+            format!(
+                "{} of {} processed",
+                progress.processed,
+                progress.total.unwrap_or_default()
+            ),
+        ),
+        None => (
+            0.15 + progress.pulse * 0.70,
+            "Working — this phase does not report a total".into(),
+        ),
+    };
+    let popover = container(
+        column![
+            text("Refreshing results").size(24),
+            text(progress.phase.clone()).size(16),
+            text(detail).size(13).color(MUTED),
+            progress_bar(0.0..=1.0, value),
+            row![
+                Space::with_width(Length::Fill),
+                button("Cancel refresh")
+                    .style(secondary_button)
+                    .on_press(Message::CancelScan)
+            ]
+        ]
+        .spacing(12)
+        .padding(24),
+    )
+    .max_width(520)
+    .style(raised_style);
+    let overlay = container(popover)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba8(8, 12, 20, 0.72))),
+            ..container::Style::default()
+        });
+    stack![results(previous), overlay].into()
+}
+
+fn cleaning(progress: &CleanupProgress) -> Element<'static, Message> {
+    let action = if progress.action == CleanupAction::Trash {
+        "Moving files to Trash"
+    } else {
+        "Permanently deleting files"
+    };
+    let fraction = if progress.total == 0 {
+        0.0
+    } else {
+        progress.processed as f32 / progress.total as f32
+    };
+    let current = progress
+        .current
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Checking that selected files have not changed…".into());
+    container(
+        column![
+            text(action).size(30),
+            text(format!(
+                "{} of {} files processed",
+                progress.processed, progress.total
+            )),
+            progress_bar(0.0..=1.0, fraction),
+            text(current).size(13).color(MUTED),
+            text("The remaining files are rechecked immediately before each operation.")
+                .size(13)
+                .color(MUTED)
+        ]
+        .spacing(14)
+        .padding(28),
+    )
+    .style(raised_style)
+    .max_width(680)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
 }
 fn results(results: &ScanResults) -> Element<'_, Message> {
     let (count, bytes) = totals(&results.groups);
@@ -1879,6 +2055,7 @@ mod tests {
             scan_mode: None,
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db: Database::open_in_memory().unwrap(),
             active_scan_id: None,
@@ -1922,6 +2099,7 @@ mod tests {
             scan_mode: Some(ScanMode::Initial),
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db,
             active_scan_id: Some(scan_id),
@@ -1988,6 +2166,7 @@ mod tests {
             scan_mode: Some(ScanMode::Initial),
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db,
             active_scan_id: None,
@@ -2022,6 +2201,7 @@ mod tests {
             scan_mode: None,
             next_cleanup_run: 2,
             active_cleanup_run: Some(2),
+            cleanup_events: None,
             latest_result: None,
             db: Database::open_in_memory().unwrap(),
             active_scan_id: None,
@@ -2163,6 +2343,7 @@ mod tests {
             }),
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db,
             active_scan_id: Some(scan_id),
@@ -2212,6 +2393,7 @@ mod tests {
             }),
             next_cleanup_run: 0,
             active_cleanup_run: None,
+            cleanup_events: None,
             latest_result: None,
             db,
             active_scan_id: Some(scan_id),

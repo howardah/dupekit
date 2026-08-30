@@ -165,7 +165,13 @@ impl Database {
                 "ALTER TABLE cleanup_actions ADD COLUMN attempted_files INTEGER NOT NULL DEFAULT 0;
                  CREATE TABLE cleanup_failures (id INTEGER PRIMARY KEY, cleanup_action_id INTEGER NOT NULL REFERENCES cleanup_actions(id) ON DELETE CASCADE, path BLOB NOT NULL, message TEXT NOT NULL);
                  CREATE INDEX cleanup_failures_action_id ON cleanup_failures(cleanup_action_id);
-                 INSERT INTO schema_migrations(version) VALUES(3);",
+                INSERT INTO schema_migrations(version) VALUES(3);",
+            )?;
+        }
+        if version < 4 {
+            self.connection.execute_batch(
+                "ALTER TABLE duplicate_files ADD COLUMN modified_at_nanos INTEGER;
+                 INSERT INTO schema_migrations(version) VALUES(4);",
             )?;
         }
         Ok(())
@@ -529,7 +535,7 @@ fn group_from_connection(
     id: i64,
     file_size: u64,
 ) -> Result<DuplicateGroup> {
-    let mut stmt=connection.prepare("SELECT id,path,size,modified_at,selected FROM duplicate_files WHERE group_id=?1 ORDER BY id")?;
+    let mut stmt=connection.prepare("SELECT id,path,size,modified_at,modified_at_nanos,selected FROM duplicate_files WHERE group_id=?1 ORDER BY id")?;
     let raw = stmt
         .query_map([id], |r| {
             Ok((
@@ -537,24 +543,30 @@ fn group_from_connection(
                 r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, Option<i64>>(3)?,
-                r.get::<_, i64>(4)? != 0,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, i64>(5)? != 0,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut selected = Vec::new();
     let files = raw
         .into_iter()
-        .map(|(file_id, path, size, modified, checked)| {
-            if checked {
-                selected.push(DuplicateFileId(i64_to_u64(file_id)?));
-            }
-            Ok(DuplicateFile {
-                id: DuplicateFileId(i64_to_u64(file_id)?),
-                path: decode_path(&path)?,
-                size: i64_to_u64(size)?,
-                modified: modified.map(millis_to_time).transpose()?,
-            })
-        })
+        .map(
+            |(file_id, path, size, modified_millis, modified_nanos, checked)| {
+                if checked {
+                    selected.push(DuplicateFileId(i64_to_u64(file_id)?));
+                }
+                Ok(DuplicateFile {
+                    id: DuplicateFileId(i64_to_u64(file_id)?),
+                    path: decode_path(&path)?,
+                    size: i64_to_u64(size)?,
+                    modified: modified_nanos
+                        .map(nanos_to_time)
+                        .or_else(|| modified_millis.map(millis_to_time))
+                        .transpose()?,
+                })
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
     let mut group = DuplicateGroup::new(GroupId(i64_to_u64(id)?), file_size, files)
         .map_err(|_| StorageError::InvalidTime)?;
@@ -593,7 +605,7 @@ fn insert_file(
     file: &DuplicateFile,
     selected: bool,
 ) -> Result<i64> {
-    tx.execute("INSERT INTO duplicate_files(group_id,path,size,modified_at,selected) VALUES(?1,?2,?3,?4,?5)",params![group_id,encode_path(&file.path),u64_to_i64(file.size)?,file.modified.map(time_to_millis).transpose()?,selected as i64])?;
+    tx.execute("INSERT INTO duplicate_files(group_id,path,size,modified_at,modified_at_nanos,selected) VALUES(?1,?2,?3,?4,?5,?6)",params![group_id,encode_path(&file.path),u64_to_i64(file.size)?,file.modified.map(time_to_millis).transpose()?,file.modified.map(time_to_nanos).transpose()?,selected as i64])?;
     Ok(tx.last_insert_rowid())
 }
 fn time_to_millis(time: SystemTime) -> Result<i64> {
@@ -607,6 +619,19 @@ fn time_to_millis(time: SystemTime) -> Result<i64> {
 fn millis_to_time(value: i64) -> std::result::Result<SystemTime, rusqlite::Error> {
     u64::try_from(value)
         .map(|v| UNIX_EPOCH + std::time::Duration::from_millis(v))
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
+fn time_to_nanos(time: SystemTime) -> Result<i64> {
+    i64::try_from(
+        time.duration_since(UNIX_EPOCH)
+            .map_err(|_| StorageError::InvalidTime)?
+            .as_nanos(),
+    )
+    .map_err(|_| StorageError::InvalidTime)
+}
+fn nanos_to_time(value: i64) -> std::result::Result<SystemTime, rusqlite::Error> {
+    u64::try_from(value)
+        .map(|v| UNIX_EPOCH + std::time::Duration::from_nanos(v))
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
 }
 fn u64_to_i64(value: u64) -> Result<i64> {
@@ -772,6 +797,7 @@ mod tests {
     fn replacement_returns_database_owned_ids_with_selection_intact() {
         let (_file, mut db) = db();
         let id = db.create_scan(&scan(PathBuf::from("/a"))).unwrap();
+        let precise_modified = at(2_000) + std::time::Duration::from_nanos(123_456_789);
         db.replace_results(
             id,
             &results(),
@@ -792,7 +818,7 @@ mod tests {
                     id: DuplicateFileId(901),
                     path: PathBuf::from("/photos/été a.jpg"),
                     size: 20,
-                    modified: Some(at(2_000)),
+                    modified: Some(precise_modified),
                 },
                 DuplicateFile {
                     id: DuplicateFileId(902),
@@ -823,6 +849,7 @@ mod tests {
         assert_ne!(loaded[0].id, replacement[0].id);
         assert_ne!(loaded[0].files[0].id, replacement[0].files[0].id);
         assert!(loaded[0].is_selected(loaded[0].files[1].id));
+        assert_eq!(loaded[0].files[0].modified, Some(precise_modified));
         assert_eq!(loaded, db.groups(id).unwrap());
     }
 

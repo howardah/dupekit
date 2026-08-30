@@ -81,6 +81,12 @@ impl CleanupService {
         }
     }
     pub fn execute(preflight: CleanupPreflight) -> Result<CleanupOutcome, CleanupError> {
+        Self::execute_with_progress(preflight, |_, _, _| {})
+    }
+    pub fn execute_with_progress(
+        preflight: CleanupPreflight,
+        mut progress: impl FnMut(usize, usize, &std::path::Path),
+    ) -> Result<CleanupOutcome, CleanupError> {
         if !preflight.missing.is_empty() || !preflight.changed.is_empty() {
             return Err(CleanupError::UnsafePreflight {
                 missing: preflight.missing.len(),
@@ -93,7 +99,9 @@ impl CleanupService {
             recovered_bytes: 0,
             failures: vec![],
         };
-        for file in preflight.plan.files {
+        let total = preflight.plan.files.len();
+        for (index, file) in preflight.plan.files.into_iter().enumerate() {
+            let path = file.path.clone();
             // The preflight check is only a preview.  A file can be replaced,
             // modified, or removed while the confirmation dialog is open (or
             // between two deletes), so check the exact snapshot again at the
@@ -103,6 +111,7 @@ impl CleanupService {
                     path: file.path,
                     message,
                 });
+                progress(index + 1, total, &path);
                 continue;
             }
             match remove(&file.path, preflight.plan.action) {
@@ -115,6 +124,7 @@ impl CleanupService {
                     message: error.to_string(),
                 }),
             }
+            progress(index + 1, total, &path);
         }
         Ok(out)
     }
@@ -263,12 +273,17 @@ mod tests {
         let preflight = CleanupService::preflight(plan);
         fs::write(&changed, b"changed after preflight").unwrap();
 
-        let out = CleanupService::execute(preflight).unwrap();
+        let mut progress = Vec::new();
+        let out = CleanupService::execute_with_progress(preflight, |processed, total, path| {
+            progress.push((processed, total, path.to_path_buf()));
+        })
+        .unwrap();
         assert_eq!(out.removed, vec![removed.clone()]);
         assert_eq!(out.recovered_bytes, 4);
         assert_eq!(out.failures.len(), 1);
         assert_eq!(out.failures[0].path, changed);
         assert!(!removed.exists());
         assert!(changed.exists());
+        assert_eq!(progress, vec![(1, 2, removed), (2, 2, changed)]);
     }
 }
