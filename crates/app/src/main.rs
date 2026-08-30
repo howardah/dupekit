@@ -81,6 +81,9 @@ struct HistoryItem {
 enum Screen {
     Home,
     Scanning(ScanProgress),
+    /// fclones cannot be interrupted while it owns its cache database. Keep
+    /// the scan task alive until it unwinds and releases that lock.
+    Cancelling,
     Results(ScanResults),
     Confirm {
         permanent: bool,
@@ -202,6 +205,10 @@ impl App {
             active_scan_id: None,
             notice: None,
         }
+    }
+
+    fn scan_worker_active(&self) -> bool {
+        self.active_scan_run.is_some()
     }
 }
 #[derive(Debug, Clone)]
@@ -350,9 +357,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.active_scan_run != Some(run) {
                 return Task::none();
             }
+            let was_cancelling = matches!(app.screen, Screen::Cancelling)
+                || app
+                    .scan_cancel
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled);
             app.scan_events = None;
             app.scan_cancel = None;
             app.active_scan_run = None;
+            // Cancellation is only complete once this task returns: that is
+            // when fclones has dropped its cache and released its OS lock.
+            // Its result (or its eventual cancellation error) must never be
+            // persisted or shown as a failed/completed scan.
+            if was_cancelling {
+                app.running_scan_id = None;
+                app.active_scan_id = None;
+                app.screen = Screen::Home;
+                return Task::none();
+            }
             match result {
                 Ok(result) => {
                     let mut displayed_result = result;
@@ -450,6 +472,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::CancelScan => {
+            if !matches!(app.screen, Screen::Scanning(_)) {
+                return Task::none();
+            }
             if let Some(cancel) = &app.scan_cancel {
                 cancel.cancel();
             }
@@ -467,13 +492,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
                 refresh_history(app);
             }
-            app.scan_cancel = None;
-            app.scan_events = None;
-            app.active_scan_run = None;
+            // Do not clear the worker bookkeeping here. The synchronous
+            // fclones call may still own ~/.cache/fclones/db for some time.
+            // ScanCompleted performs that cleanup after it has returned.
             if app.active_scan_id == cancelled_scan_id {
                 app.active_scan_id = None;
             }
-            app.screen = Screen::Home
+            app.screen = Screen::Cancelling
         }
         Message::ToggleFile(id) => {
             if let Screen::Results(r) = &mut app.screen {
@@ -724,28 +749,44 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.screen = Screen::Home;
             }
         }
-        Message::Home => app.screen = Screen::Home,
-        Message::OpenHistory => app.screen = Screen::History,
-        Message::DismissNotice => app.notice = None,
-        Message::Reopen(id) => match app.db.scan(id) {
-            Err(error) => app.notice = Some(format!("Could not open saved scan: {error}")),
-            Ok(scan) if scan.status != ScanStatus::Completed => {
-                app.notice = Some("Only completed scans have results that can be reopened.".into());
+        Message::Home => {
+            if !app.scan_worker_active() {
+                app.screen = Screen::Home;
             }
-            Ok(scan) => match app.db.groups(id) {
-                Err(error) => app.notice = Some(format!("Could not load saved results: {error}")),
-                Ok(groups) => {
-                    app.paths = scan.paths;
-                    app.active_scan_id = Some(id);
-                    app.latest_result = Some(ScanResult::from_groups(groups.clone()));
-                    app.screen = Screen::Results(ScanResults {
-                        groups,
-                        page: 0,
-                        scan_name: scan.name.unwrap_or_else(|| "Saved scan".into()),
-                    });
+        }
+        Message::OpenHistory => {
+            if !app.scan_worker_active() {
+                app.screen = Screen::History;
+            }
+        }
+        Message::DismissNotice => app.notice = None,
+        Message::Reopen(id) => {
+            if app.scan_worker_active() {
+                return Task::none();
+            }
+            match app.db.scan(id) {
+                Err(error) => app.notice = Some(format!("Could not open saved scan: {error}")),
+                Ok(scan) if scan.status != ScanStatus::Completed => {
+                    app.notice =
+                        Some("Only completed scans have results that can be reopened.".into());
                 }
-            },
-        },
+                Ok(scan) => match app.db.groups(id) {
+                    Err(error) => {
+                        app.notice = Some(format!("Could not load saved results: {error}"))
+                    }
+                    Ok(groups) => {
+                        app.paths = scan.paths;
+                        app.active_scan_id = Some(id);
+                        app.latest_result = Some(ScanResult::from_groups(groups.clone()));
+                        app.screen = Screen::Results(ScanResults {
+                            groups,
+                            page: 0,
+                            scan_name: scan.name.unwrap_or_else(|| "Saved scan".into()),
+                        });
+                    }
+                },
+            }
+        }
     };
     Task::none()
 }
@@ -850,6 +891,7 @@ fn view(app: &App) -> Element<'_, Message> {
     let body = match &app.screen {
         Screen::Home => home(app),
         Screen::Scanning(progress) => scanning(progress),
+        Screen::Cancelling => cancelling(),
         Screen::Results(r) => results(r),
         Screen::Confirm {
             permanent,
@@ -864,7 +906,7 @@ fn view(app: &App) -> Element<'_, Message> {
         } => cleanup_done(*permanent, *count, *bytes),
         Screen::History => history(app),
     };
-    let mut content = column![header()].spacing(24).padding([24, 32]);
+    let mut content = column![header(app)].spacing(24).padding([24, 32]);
     if let Some(notice) = &app.notice {
         content = content.push(
             container(row![
@@ -892,7 +934,8 @@ fn view(app: &App) -> Element<'_, Message> {
     })
     .into()
 }
-fn header() -> Element<'static, Message> {
+fn header(app: &App) -> Element<'static, Message> {
+    let available = !app.scan_worker_active();
     container(
         row![
             column![
@@ -903,15 +946,36 @@ fn header() -> Element<'static, Message> {
             Space::with_width(Length::Fill),
             button("New scan")
                 .style(secondary_button)
-                .on_press(Message::Home),
+                .on_press_maybe(available.then_some(Message::Home)),
             button("History")
                 .style(secondary_button)
-                .on_press(Message::OpenHistory)
+                .on_press_maybe(available.then_some(Message::OpenHistory))
         ]
         .spacing(8)
         .align_y(alignment::Vertical::Center),
     )
     .padding([0, 14])
+    .into()
+}
+fn cancelling() -> Element<'static, Message> {
+    container(
+        column![
+            text("Cancelling scan").size(30),
+            text("Waiting for fclones to safely finish and release its cache lock.")
+                .size(15)
+                .color(MUTED),
+            Space::with_height(20),
+            text("The scan's results will be discarded. You can start another scan as soon as this screen closes.")
+                .size(14)
+                .color(MUTED),
+        ]
+        .spacing(12)
+        .padding(28),
+    )
+    .style(raised_style)
+    .max_width(680)
+    .center_x(Length::Fill)
+    .height(Length::Fill)
     .into()
 }
 fn home(app: &App) -> Element<'_, Message> {
@@ -1635,6 +1699,113 @@ mod tests {
         drop(task);
         assert_eq!(app.active_scan_run, Some(2));
         assert!(matches!(app.screen, Screen::Scanning(_)));
+    }
+
+    #[test]
+    fn cancelling_scan_blocks_a_new_scan_until_its_worker_returns() {
+        let mut db = Database::open_in_memory().unwrap();
+        let scan_id = db
+            .create_scan(&NewScan {
+                name: Some("Scan".into()),
+                started_at: std::time::SystemTime::now(),
+                paths: vec![],
+            })
+            .unwrap();
+        let cancellation = CancellationToken::default();
+        let mut app = App {
+            screen: Screen::Scanning(ScanProgress::default()),
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: Some(cancellation.clone()),
+            scan_events: None,
+            next_scan_run: 5,
+            active_scan_run: Some(5),
+            running_scan_id: Some(scan_id),
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
+            latest_result: None,
+            db,
+            active_scan_id: Some(scan_id),
+            notice: None,
+        };
+
+        drop(update(&mut app, Message::CancelScan));
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(app.screen, Screen::Cancelling));
+        assert_eq!(app.active_scan_run, Some(5));
+        assert!(app.scan_cancel.is_some());
+        assert_eq!(app.running_scan_id, None);
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Cancelled);
+
+        // This is the reducer equivalent of immediately clicking "Find
+        // duplicates" again. It must not launch a worker using the locked
+        // fclones cache database.
+        drop(update(&mut app, Message::StartScan));
+        assert_eq!(app.active_scan_run, Some(5));
+        assert!(matches!(app.screen, Screen::Cancelling));
+
+        // The old worker has now returned, so its fclones resources (and the
+        // cache lock) have been dropped. Its error remains cancellation, not
+        // a failed history record.
+        drop(update(
+            &mut app,
+            Message::ScanCompleted {
+                run: 5,
+                result: Err("scan cancelled".into()),
+            },
+        ));
+        assert!(matches!(app.screen, Screen::Home));
+        assert_eq!(app.active_scan_run, None);
+        assert!(app.scan_cancel.is_none());
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancelled_worker_success_is_discarded_after_releasing_the_lock() {
+        let mut db = Database::open_in_memory().unwrap();
+        let scan_id = db
+            .create_scan(&NewScan {
+                name: Some("Scan".into()),
+                started_at: std::time::SystemTime::now(),
+                paths: vec![],
+            })
+            .unwrap();
+        db.finish_scan(scan_id, ScanStatus::Cancelled, std::time::SystemTime::now())
+            .unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut app = App {
+            screen: Screen::Cancelling,
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: Some(cancellation),
+            scan_events: None,
+            next_scan_run: 6,
+            active_scan_run: Some(6),
+            running_scan_id: None,
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
+            latest_result: None,
+            db,
+            active_scan_id: None,
+            notice: None,
+        };
+        drop(update(
+            &mut app,
+            Message::ScanCompleted {
+                run: 6,
+                result: Ok(ScanResult::from_groups(vec![])),
+            },
+        ));
+        assert!(matches!(app.screen, Screen::Home));
+        assert!(app.latest_result.is_none());
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Cancelled);
     }
 
     #[test]
