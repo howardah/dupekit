@@ -1,1 +1,4 @@
-/target
+/target/
+/dupekit.sqlite3
+/dupekit.sqlite3-shm
+/dupekit.sqlite3-wal
