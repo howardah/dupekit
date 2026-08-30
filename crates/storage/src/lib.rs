@@ -70,6 +70,22 @@ pub struct NewScan {
     pub name: Option<String>,
     pub started_at: SystemTime,
     pub paths: Vec<ScanPath>,
+    pub settings: ScanSettings,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanSettings {
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub cache: bool,
+}
+impl Default for ScanSettings {
+    fn default() -> Self {
+        Self {
+            min_size: Some(1_048_576),
+            max_size: None,
+            cache: true,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
@@ -80,6 +96,8 @@ pub struct Scan {
     pub status: ScanStatus,
     pub summary: Option<ScanSummary>,
     pub paths: Vec<ScanPath>,
+    pub settings: ScanSettings,
+    pub settings_recorded: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupAction {
@@ -174,6 +192,16 @@ impl Database {
                  INSERT INTO schema_migrations(version) VALUES(4);",
             )?;
         }
+        if version < 5 {
+            self.connection.execute_batch(
+                "ALTER TABLE scans ADD COLUMN min_size INTEGER;
+                 ALTER TABLE scans ADD COLUMN max_size INTEGER;
+                 ALTER TABLE scans ADD COLUMN cache INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE scans ADD COLUMN settings_recorded INTEGER NOT NULL DEFAULT 0;
+                 UPDATE scans SET min_size = 1048576 WHERE min_size IS NULL;
+                 INSERT INTO schema_migrations(version) VALUES(5);",
+            )?;
+        }
         Ok(())
     }
 
@@ -206,6 +234,16 @@ impl Database {
         summary: &ScanSummary,
         finished_at: SystemTime,
     ) -> Result<Vec<DuplicateGroup>> {
+        self.replace_results_and_load_with_settings(scan_id, groups, summary, finished_at, None)
+    }
+    pub fn replace_results_and_load_with_settings(
+        &mut self,
+        scan_id: ScanId,
+        groups: &[DuplicateGroup],
+        summary: &ScanSummary,
+        finished_at: SystemTime,
+        settings: Option<ScanSettings>,
+    ) -> Result<Vec<DuplicateGroup>> {
         let tx = self.connection.transaction()?;
         if tx
             .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |_| Ok(()))
@@ -222,6 +260,17 @@ impl Database {
             }
         }
         tx.execute("UPDATE scans SET status='completed', finished_at=?2, duplicate_bytes=?3, duplicate_files=?4, duplicate_groups=?5 WHERE id=?1", params![scan_id, time_to_millis(finished_at)?, u64_to_i64(summary.recoverable_bytes)?, u64_to_i64(summary.duplicate_files)?, u64_to_i64(summary.duplicate_groups)?])?;
+        if let Some(settings) = settings {
+            tx.execute(
+                "UPDATE scans SET min_size=?2,max_size=?3,cache=?4,settings_recorded=1 WHERE id=?1",
+                params![
+                    scan_id,
+                    settings.min_size.map(u64_to_i64).transpose()?,
+                    settings.max_size.map(u64_to_i64).transpose()?,
+                    settings.cache as i64
+                ],
+            )?;
+        }
         let loaded = groups_from_connection(&tx, scan_id)?;
         tx.commit()?;
         Ok(loaded)
@@ -245,7 +294,7 @@ impl Database {
     }
     /// Lists persisted scans newest first, including their configured paths.
     pub fn scans(&self) -> Result<Vec<Scan>> {
-        let mut stmt = self.connection.prepare("SELECT id,name,started_at,finished_at,status,duplicate_bytes,duplicate_files,duplicate_groups FROM scans ORDER BY started_at DESC,id DESC")?;
+        let mut stmt = self.connection.prepare("SELECT id,name,started_at,finished_at,status,duplicate_bytes,duplicate_files,duplicate_groups,min_size,max_size,cache,settings_recorded FROM scans ORDER BY started_at DESC,id DESC")?;
         let basics = stmt
             .query_map([], |r| {
                 Ok((
@@ -259,13 +308,30 @@ impl Database {
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, i64>(10)? != 0,
+                    r.get::<_, i64>(11)? != 0,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         basics
             .into_iter()
             .map(
-                |(id, name, started_at, finished_at, status, bytes, files, groups)| {
+                |(
+                    id,
+                    name,
+                    started_at,
+                    finished_at,
+                    status,
+                    bytes,
+                    files,
+                    groups,
+                    min_size,
+                    max_size,
+                    cache,
+                    settings_recorded,
+                )| {
                     let summary = match bytes.zip(files).zip(groups) {
                         Some(((b, f), g)) => Some(ScanSummary {
                             duplicate_groups: i64_to_u64(g)?,
@@ -282,6 +348,12 @@ impl Database {
                         status,
                         summary,
                         paths: self.scan_paths(id)?,
+                        settings: ScanSettings {
+                            min_size: min_size.map(i64_to_u64).transpose()?,
+                            max_size: max_size.map(i64_to_u64).transpose()?,
+                            cache,
+                        },
+                        settings_recorded,
                     })
                 },
             )
@@ -580,8 +652,8 @@ fn group_from_connection(
 
 fn insert_scan(tx: &Transaction<'_>, scan: &NewScan) -> Result<ScanId> {
     tx.execute(
-        "INSERT INTO scans(name,started_at,status) VALUES(?1,?2,'running')",
-        params![scan.name, time_to_millis(scan.started_at)?],
+        "INSERT INTO scans(name,started_at,status,min_size,max_size,cache,settings_recorded) VALUES(?1,?2,'running',?3,?4,?5,1)",
+        params![scan.name, time_to_millis(scan.started_at)?, scan.settings.min_size.map(u64_to_i64).transpose()?, scan.settings.max_size.map(u64_to_i64).transpose()?, scan.settings.cache as i64],
     )?;
     let id = tx.last_insert_rowid();
     for path in &scan.paths {
@@ -699,6 +771,7 @@ mod tests {
                 path,
                 preferred: true,
             }],
+            settings: ScanSettings::default(),
         }
     }
     fn results() -> Vec<DuplicateGroup> {
@@ -833,8 +906,13 @@ mod tests {
             .set_selected(DuplicateFileId(902), true)
             .unwrap();
         let replacement = vec![replacement];
+        let refreshed_settings = ScanSettings {
+            min_size: Some(42),
+            max_size: Some(4_200),
+            cache: false,
+        };
         let loaded = db
-            .replace_results_and_load(
+            .replace_results_and_load_with_settings(
                 id,
                 &replacement,
                 &ScanSummary {
@@ -843,6 +921,7 @@ mod tests {
                     recoverable_bytes: 20,
                 },
                 at(3),
+                Some(refreshed_settings),
             )
             .unwrap();
 
@@ -851,6 +930,30 @@ mod tests {
         assert!(loaded[0].is_selected(loaded[0].files[1].id));
         assert_eq!(loaded[0].files[0].modified, Some(precise_modified));
         assert_eq!(loaded, db.groups(id).unwrap());
+        assert_eq!(db.scan(id).unwrap().settings, refreshed_settings);
+        assert!(db.scan(id).unwrap().settings_recorded);
+    }
+
+    #[test]
+    fn legacy_scans_are_marked_when_settings_were_not_recorded() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let connection = Connection::open(file.path()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                     INSERT INTO schema_migrations(version) VALUES(4);
+                     CREATE TABLE scans (id INTEGER PRIMARY KEY, name TEXT, started_at INTEGER NOT NULL, finished_at INTEGER, status TEXT NOT NULL, duplicate_bytes INTEGER, duplicate_files INTEGER, duplicate_groups INTEGER);
+                     INSERT INTO scans(id,name,started_at,status) VALUES(1,'Legacy',0,'completed');
+                     CREATE TABLE duplicate_files (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, path BLOB NOT NULL, size INTEGER NOT NULL, modified_at INTEGER, selected INTEGER NOT NULL DEFAULT 0, modified_at_nanos INTEGER);",
+                )
+                .unwrap();
+        }
+
+        let db = Database::open(file.path()).unwrap();
+        let scan = db.scan(1).unwrap();
+        assert_eq!(scan.settings, ScanSettings::default());
+        assert!(!scan.settings_recorded);
     }
 
     #[test]

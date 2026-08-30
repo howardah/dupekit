@@ -4,7 +4,7 @@ use dupekit_core::{
     DuplicateGroup, DuplicateScanner, FclonesScanner, ScanConfig, ScanEvent, ScanPath, ScanResult,
     SelectionPolicy as CoreSelectionPolicy,
 };
-use dupekit_storage::{Database, NewScan, ScanId, ScanStatus};
+use dupekit_storage::{Database, NewScan, ScanId, ScanSettings, ScanStatus};
 use iced::widget::{
     Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, stack,
     text, text_input,
@@ -67,13 +67,67 @@ struct ScanResults {
     groups: Vec<DuplicateGroup>,
     page: usize,
     scan_name: String,
+    refresh_settings: RefreshSettings,
+}
+#[derive(Debug, Clone)]
+struct RefreshSettings {
+    min_size: String,
+    max_size: String,
+    cache: bool,
+    expanded: bool,
+    error: Option<String>,
+    legacy_unrecorded: bool,
+}
+impl RefreshSettings {
+    fn from_scan(settings: ScanSettings, recorded: bool) -> Self {
+        Self {
+            min_size: settings.min_size.map(size_input_value).unwrap_or_default(),
+            max_size: settings.max_size.map(size_input_value).unwrap_or_default(),
+            cache: settings.cache,
+            expanded: false,
+            error: None,
+            legacy_unrecorded: !recorded,
+        }
+    }
+
+    fn stored(&self) -> Result<ScanSettings, String> {
+        let min_size = parse_size_input(&self.min_size, "Minimum file size")?;
+        let max_size = parse_size_input(&self.max_size, "Maximum file size")?;
+        if min_size.zip(max_size).is_some_and(|(min, max)| min > max) {
+            return Err("Minimum file size cannot exceed maximum file size.".into());
+        }
+        Ok(ScanSettings {
+            min_size,
+            max_size,
+            cache: self.cache,
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "Min {} · Max {} · Cache {}",
+            if self.min_size.trim().is_empty() {
+                "none"
+            } else {
+                self.min_size.trim()
+            },
+            if self.max_size.trim().is_empty() {
+                "none"
+            } else {
+                self.max_size.trim()
+            },
+            if self.cache { "on" } else { "off" }
+        )
+    }
 }
 /// Records why the in-flight scan was started. Refreshes deliberately replace
 /// an existing completed result set; a failed or cancelled refresh must leave
 /// that result set intact.
 #[derive(Debug, Clone)]
 enum ScanMode {
-    Initial,
+    Initial {
+        settings: RefreshSettings,
+    },
     Refresh {
         previous: ScanResults,
         selections: BTreeMap<PathBuf, bool>,
@@ -205,7 +259,7 @@ struct App {
     next_cleanup_run: u64,
     active_cleanup_run: Option<u64>,
     cleanup_events: Option<Receiver<CleanupProgressEvent>>,
-    latest_result: Option<ScanResult>,
+    latest_review: Option<ScanResults>,
     db: Database,
     active_scan_id: Option<ScanId>,
     notice: Option<String>,
@@ -231,7 +285,7 @@ impl App {
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db,
             active_scan_id: None,
             notice: None,
@@ -251,6 +305,10 @@ enum Message {
     MinSize(String),
     MaxSize(String),
     ToggleCache(bool),
+    ToggleRefreshSettings,
+    RefreshMinSize(String),
+    RefreshMaxSize(String),
+    ToggleRefreshCache(bool),
     StartScan,
     RefreshResults,
     ScanCompleted {
@@ -320,6 +378,34 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::MinSize(v) => app.min_size = v,
         Message::MaxSize(v) => app.max_size = v,
         Message::ToggleCache(v) => app.cache = v,
+        Message::ToggleRefreshSettings => {
+            if let Screen::Results(results) = &mut app.screen {
+                results.refresh_settings.expanded = !results.refresh_settings.expanded;
+                results.refresh_settings.error = None;
+                app.latest_review = Some(results.clone());
+            }
+        }
+        Message::RefreshMinSize(value) => {
+            if let Screen::Results(results) = &mut app.screen {
+                results.refresh_settings.min_size = value;
+                results.refresh_settings.error = None;
+                app.latest_review = Some(results.clone());
+            }
+        }
+        Message::RefreshMaxSize(value) => {
+            if let Screen::Results(results) = &mut app.screen {
+                results.refresh_settings.max_size = value;
+                results.refresh_settings.error = None;
+                app.latest_review = Some(results.clone());
+            }
+        }
+        Message::ToggleRefreshCache(value) => {
+            if let Screen::Results(results) = &mut app.screen {
+                results.refresh_settings.cache = value;
+                results.refresh_settings.error = None;
+                app.latest_review = Some(results.clone());
+            }
+        }
         Message::StartScan => {
             if app.active_scan_run.is_some() {
                 app.notice = Some(
@@ -330,33 +416,30 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.paths.is_empty() {
                 app.notice = Some("Add at least one folder before starting a scan.".into());
             } else {
-                let min_size = match parse_size_input(&app.min_size, "Minimum file size") {
+                let settings = RefreshSettings {
+                    min_size: app.min_size.clone(),
+                    max_size: app.max_size.clone(),
+                    cache: app.cache,
+                    expanded: false,
+                    error: None,
+                    legacy_unrecorded: false,
+                };
+                let stored = match settings.stored() {
                     Ok(value) => value,
                     Err(error) => {
                         app.notice = Some(error);
                         return Task::none();
                     }
                 };
-                let max_size = match parse_size_input(&app.max_size, "Maximum file size") {
-                    Ok(value) => value,
-                    Err(error) => {
-                        app.notice = Some(error);
-                        return Task::none();
-                    }
-                };
-                if min_size.zip(max_size).is_some_and(|(min, max)| min > max) {
-                    app.notice = Some("Minimum file size cannot exceed maximum file size.".into());
-                    return Task::none();
-                }
                 return begin_scan(
                     app,
                     ScanConfig {
                         paths: app.paths.clone(),
-                        min_size,
-                        max_size,
-                        cache: app.cache,
+                        min_size: stored.min_size,
+                        max_size: stored.max_size,
+                        cache: stored.cache,
                     },
-                    ScanMode::Initial,
+                    ScanMode::Initial { settings },
                 );
             }
         }
@@ -364,38 +447,29 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.active_scan_run.is_some() || app.active_cleanup_run.is_some() {
                 return Task::none();
             }
-            let Screen::Results(previous) = &app.screen else {
+            let Screen::Results(previous) = &mut app.screen else {
                 return Task::none();
             };
-            let min_size = match parse_size_input(&app.min_size, "Minimum file size") {
+            let stored = match previous.refresh_settings.stored() {
                 Ok(value) => value,
                 Err(error) => {
-                    app.notice = Some(error);
+                    previous.refresh_settings.error = Some(error);
                     return Task::none();
                 }
             };
-            let max_size = match parse_size_input(&app.max_size, "Maximum file size") {
-                Ok(value) => value,
-                Err(error) => {
-                    app.notice = Some(error);
-                    return Task::none();
-                }
-            };
-            if min_size.zip(max_size).is_some_and(|(min, max)| min > max) {
-                app.notice = Some("Minimum file size cannot exceed maximum file size.".into());
-                return Task::none();
-            }
+            previous.refresh_settings.error = None;
             let selections = selection_by_path(&previous.groups);
+            let previous = previous.clone();
             return begin_scan(
                 app,
                 ScanConfig {
                     paths: app.paths.clone(),
-                    min_size,
-                    max_size,
-                    cache: app.cache,
+                    min_size: stored.min_size,
+                    max_size: stored.max_size,
+                    cache: stored.cache,
                 },
                 ScanMode::Refresh {
-                    previous: previous.clone(),
+                    previous,
                     selections,
                 },
             );
@@ -404,7 +478,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.active_scan_run != Some(run) {
                 return Task::none();
             }
-            let mode = app.scan_mode.take().unwrap_or(ScanMode::Initial);
+            let Some(mode) = app.scan_mode.take() else {
+                app.notice = Some("Scan finished without its saved configuration.".into());
+                return Task::none();
+            };
             let was_cancelling = matches!(app.screen, Screen::Cancelling)
                 || app
                     .scan_cancel
@@ -420,12 +497,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if was_cancelling {
                 app.running_scan_id = None;
                 match mode {
-                    ScanMode::Initial => {
+                    ScanMode::Initial { .. } => {
                         app.active_scan_id = None;
                         app.screen = Screen::Home;
                     }
                     ScanMode::Refresh { previous, .. } => {
-                        app.latest_result = Some(ScanResult::from_groups(previous.groups.clone()));
+                        app.latest_review = Some(previous.clone());
                         app.screen = Screen::Results(previous);
                         append_notice(
                             app,
@@ -443,11 +520,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         displayed_result = ScanResult::from_groups(displayed_result.groups);
                     }
                     if let Some(id) = app.running_scan_id.take() {
-                        let persisted = match app.db.replace_results_and_load(
+                        let stored_settings = match &mode {
+                            ScanMode::Initial { settings } => settings.stored(),
+                            ScanMode::Refresh { previous, .. } => {
+                                previous.refresh_settings.stored()
+                            }
+                        }
+                        .expect("scan settings were validated before the worker started");
+                        let persisted = match app.db.replace_results_and_load_with_settings(
                             id,
                             &displayed_result.groups,
                             &displayed_result.summary,
                             std::time::SystemTime::now(),
+                            Some(stored_settings),
                         ) {
                             // Database-owned IDs are returned by the same
                             // transaction that writes the new result set.
@@ -471,10 +556,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                             app.active_scan_id = Some(id);
                         } else if !persisted {
                             match &mode {
-                                ScanMode::Initial => app.active_scan_id = None,
+                                ScanMode::Initial { .. } => app.active_scan_id = None,
                                 ScanMode::Refresh { previous, .. } => {
-                                    app.latest_result =
-                                        Some(ScanResult::from_groups(previous.groups.clone()));
+                                    app.latest_review = Some(previous.clone());
                                     app.screen = Screen::Results(previous.clone());
                                     return Task::none();
                                 }
@@ -482,16 +566,30 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         }
                     }
                     if matches!(app.screen, Screen::Scanning(_)) {
-                        app.latest_result = Some(displayed_result.clone());
-                        app.screen = Screen::Results(ScanResults {
+                        let (scan_name, mut refresh_settings) = match &mode {
+                            ScanMode::Initial { settings } => {
+                                ("Current scan".into(), settings.clone())
+                            }
+                            ScanMode::Refresh { previous, .. } => (
+                                previous.scan_name.clone(),
+                                previous.refresh_settings.clone(),
+                            ),
+                        };
+                        refresh_settings.expanded = false;
+                        refresh_settings.error = None;
+                        refresh_settings.legacy_unrecorded = false;
+                        let review = ScanResults {
                             groups: displayed_result.groups,
                             page: 0,
-                            scan_name: "Current scan".into(),
-                        });
+                            scan_name,
+                            refresh_settings,
+                        };
+                        app.latest_review = Some(review.clone());
+                        app.screen = Screen::Results(review);
                     }
                 }
                 Err(error) => {
-                    if matches!(mode, ScanMode::Initial)
+                    if matches!(mode, ScanMode::Initial { .. })
                         && let Some(id) = app.running_scan_id.take()
                     {
                         if let Err(persist_error) = app.db.finish_scan(
@@ -513,14 +611,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                     if matches!(app.screen, Screen::Scanning(_)) {
                         match mode {
-                            ScanMode::Initial => {
+                            ScanMode::Initial { .. } => {
                                 append_notice(app, format!("Scan failed: {error}"));
                                 app.screen = Screen::Home;
                             }
                             ScanMode::Refresh { previous, .. } => {
                                 app.running_scan_id = None;
-                                app.latest_result =
-                                    Some(ScanResult::from_groups(previous.groups.clone()));
+                                app.latest_review = Some(previous.clone());
                                 app.screen = Screen::Results(previous);
                                 append_notice(
                                     app,
@@ -568,7 +665,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 cancel.cancel();
             }
             let cancelled_scan_id = app.running_scan_id.take();
-            if matches!(app.scan_mode, Some(ScanMode::Initial))
+            if matches!(app.scan_mode, Some(ScanMode::Initial { .. }))
                 && let Some(id) = cancelled_scan_id
             {
                 if let Err(error) = app.db.finish_scan(
@@ -586,7 +683,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Do not clear the worker bookkeeping here. The synchronous
             // fclones call may still own ~/.cache/fclones/db for some time.
             // ScanCompleted performs that cleanup after it has returned.
-            if matches!(app.scan_mode, Some(ScanMode::Initial))
+            if matches!(app.scan_mode, Some(ScanMode::Initial { .. }))
                 && app.active_scan_id == cancelled_scan_id
             {
                 app.active_scan_id = None;
@@ -620,7 +717,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     r.groups = before;
                     app.notice = Some(format!("Selection was not saved and was reverted: {error}"));
                 }
-                app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                app.latest_review = Some(r.clone());
             }
         }
         Message::ApplyPolicy(p) => {
@@ -646,7 +743,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.notice = Some(format!(
                             "Selection policy was not saved and was reverted: {error}"
                         ));
-                        app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                        app.latest_review = Some(r.clone());
                         return Task::none();
                     }
                 }
@@ -658,11 +755,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.notice = Some(format!(
                             "Selection policy was not saved and was reverted: {error}"
                         ));
-                        app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                        app.latest_review = Some(r.clone());
                         return Task::none();
                     }
                 }
-                app.latest_result = Some(ScanResult::from_groups(r.groups.clone()));
+                app.latest_review = Some(r.clone());
             }
         }
         Message::PageBack => {
@@ -687,12 +784,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::CancelConfirm => {
-            if let Some(result) = &app.latest_result {
-                app.screen = Screen::Results(ScanResults {
-                    groups: result.groups.clone(),
-                    page: 0,
-                    scan_name: "Current scan".into(),
-                });
+            if let Some(review) = &app.latest_review {
+                app.screen = Screen::Results(review.clone());
             } else {
                 app.screen = Screen::Home;
             }
@@ -709,8 +802,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     acknowledged,
                     ..
                 },
-                Some(result),
-            ) = (app.screen.clone(), app.latest_result.clone())
+                Some(review),
+            ) = (app.screen.clone(), app.latest_review.clone())
             {
                 // A cleanup is destructive. Ignore repeat clicks and do not
                 // begin a second operation until this one has reported back.
@@ -729,6 +822,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.next_cleanup_run = app.next_cleanup_run.wrapping_add(1);
                 let run = app.next_cleanup_run;
                 let scan_id = app.active_scan_id;
+                let result = ScanResult::from_groups(review.groups);
                 let plan = match CleanupService::plan(&result, action) {
                     Ok(plan) => plan,
                     Err(error) => {
@@ -810,7 +904,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 } else {
                     if app.active_scan_id == Some(scan_id) {
                         match app.db.groups(scan_id) {
-                            Ok(groups) => app.latest_result = Some(ScanResult::from_groups(groups)),
+                            Ok(groups) => {
+                                if let Some(review) = &mut app.latest_review {
+                                    review.groups = groups;
+                                    review.page = review.page.min(
+                                        review.groups.len().saturating_sub(1) / GROUPS_PER_PAGE,
+                                    );
+                                }
+                            }
                             Err(error) => append_notice(
                                 app,
                                 format!(
@@ -863,12 +964,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.active_cleanup_run = None;
             app.cleanup_events = None;
             app.notice = Some(error);
-            if let Some(result) = &app.latest_result {
-                app.screen = Screen::Results(ScanResults {
-                    groups: result.groups.clone(),
-                    page: 0,
-                    scan_name: "Current scan".into(),
-                });
+            if let Some(review) = &app.latest_review {
+                app.screen = Screen::Results(review.clone());
             } else {
                 app.screen = Screen::Home;
             }
@@ -901,12 +998,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     Ok(groups) => {
                         app.paths = scan.paths;
                         app.active_scan_id = Some(id);
-                        app.latest_result = Some(ScanResult::from_groups(groups.clone()));
-                        app.screen = Screen::Results(ScanResults {
+                        let review = ScanResults {
                             groups,
                             page: 0,
                             scan_name: scan.name.unwrap_or_else(|| "Saved scan".into()),
-                        });
+                            refresh_settings: RefreshSettings::from_scan(
+                                scan.settings,
+                                scan.settings_recorded,
+                            ),
+                        };
+                        app.latest_review = Some(review.clone());
+                        app.screen = Screen::Results(review);
                     }
                 },
             }
@@ -922,11 +1024,16 @@ fn begin_scan(app: &mut App, config: ScanConfig, mode: ScanMode) -> Task<Message
     let worker_cancellation = cancellation.clone();
     let (events, event_receiver) = std::sync::mpsc::channel();
 
-    if matches!(mode, ScanMode::Initial) {
+    if matches!(mode, ScanMode::Initial { .. }) {
         app.active_scan_id = match app.db.create_scan(&NewScan {
             name: Some("Scan".into()),
             started_at: std::time::SystemTime::now(),
             paths: app.paths.clone(),
+            settings: ScanSettings {
+                min_size: config.min_size,
+                max_size: config.max_size,
+                cache: config.cache,
+            },
         }) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -1134,6 +1241,29 @@ fn parse_size_input(value: &str, field: &str) -> Result<Option<u64>, String> {
         return Err(format!("{field} is too large."));
     }
     Ok(Some(bytes as u64))
+}
+
+fn size_input_value(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TB", 1 << 40),
+        ("GB", 1 << 30),
+        ("MB", 1 << 20),
+        ("KB", 1 << 10),
+    ];
+    for (unit, factor) in UNITS {
+        for denominator in [1_u64, 2, 4, 8] {
+            let scaled = u128::from(bytes) * u128::from(denominator);
+            if scaled % u128::from(factor) == 0 {
+                let numerator = scaled / u128::from(factor);
+                if denominator == 1 {
+                    return format!("{numerator} {unit}");
+                }
+                let value = numerator as f64 / denominator as f64;
+                return format!("{} {unit}", format!("{value:.3}").trim_end_matches('0'));
+            }
+        }
+    }
+    format!("{bytes} B")
 }
 
 fn view(app: &App) -> Element<'_, Message> {
@@ -1478,32 +1608,32 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
         groups = groups.push(group_view(g));
     }
     let pages = results.groups.len().div_ceil(GROUPS_PER_PAGE);
-    column![
-        row![
-            column![
-                text("Review duplicates").size(30),
-                text(format!(
-                    "{} · Select files to remove; one copy is always kept.",
-                    results.scan_name
-                ))
-                .size(14)
-                .color(MUTED)
-            ],
-            Space::with_width(Length::Fill),
-            column![
-                text("SELECTED").size(11).color(MUTED),
-                text(format!("{} files · {}", count, bytes_label(bytes)))
-                    .align_x(alignment::Horizontal::Right),
-                text(format!(
-                    "{} potentially reclaimable",
-                    bytes_label(potential)
-                ))
-                .size(12)
-                .color(MUTED)
-                .align_x(alignment::Horizontal::Right)
-            ]
+    let header = row![
+        column![
+            text("Review duplicates").size(30),
+            text(format!(
+                "{} · Select files to remove; one copy is always kept.",
+                results.scan_name
+            ))
+            .size(14)
+            .color(MUTED)
         ],
-        container(
+        Space::with_width(Length::Fill),
+        column![
+            text("SELECTED").size(11).color(MUTED),
+            text(format!("{} files · {}", count, bytes_label(bytes)))
+                .align_x(alignment::Horizontal::Right),
+            text(format!(
+                "{} potentially reclaimable",
+                bytes_label(potential)
+            ))
+            .size(12)
+            .color(MUTED)
+            .align_x(alignment::Horizontal::Right)
+        ]
+    ];
+    let toolbar = container(
+        column![
             row![
                 text(format!(
                     "{} groups · {} files",
@@ -1511,22 +1641,101 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
                     results.groups.iter().map(|g| g.files.len()).sum::<usize>()
                 ))
                 .size(14)
-                .color(MUTED)
-                .width(Length::Fill),
-                button("Refresh results")
-                    .style(secondary_button)
-                    .on_press(Message::RefreshResults),
+                .color(MUTED),
+                Space::with_width(Length::Fill),
                 text("Automatic selection").size(13).color(MUTED),
                 pick_list(&UiPolicy::ALL[..], None::<UiPolicy>, Message::ApplyPolicy)
                     .placeholder("Select duplicates")
             ]
             .align_y(alignment::Vertical::Center)
+            .spacing(12),
+            row![
+                text("Refresh settings for this scan").size(13).color(MUTED),
+                Space::with_width(Length::Fill),
+                text(results.refresh_settings.summary())
+                    .size(12)
+                    .color(MUTED),
+                button(if results.refresh_settings.expanded {
+                    "Hide refresh settings"
+                } else {
+                    "Refresh…"
+                })
+                .style(secondary_button)
+                .on_press(Message::ToggleRefreshSettings)
+            ]
+            .align_y(alignment::Vertical::Center)
             .spacing(12)
-        )
-        .padding(12)
-        .style(card_style),
-        scrollable(groups).height(Length::Fill),
-        row![
+        ]
+        .spacing(10),
+    )
+    .padding(12)
+    .style(card_style);
+    let mut body = column![header, toolbar].spacing(14);
+    if results.refresh_settings.expanded {
+        let mut settings = column![
+            text("Refresh settings").size(18),
+            text("These settings belong to this scan and will be saved after a successful refresh.")
+                .size(13)
+                .color(MUTED),
+            text("Changes take effect only when you refresh.")
+                .size(13)
+                .color(MUTED),
+            row![
+                column![
+                    text("Minimum file size").size(13).color(MUTED),
+                    text_input("No minimum", &results.refresh_settings.min_size)
+                        .on_input(Message::RefreshMinSize)
+                        .padding(10)
+                ]
+                .width(Length::Fill),
+                column![
+                    text("Maximum file size (optional)").size(13).color(MUTED),
+                    text_input("No limit", &results.refresh_settings.max_size)
+                        .on_input(Message::RefreshMaxSize)
+                        .padding(10)
+                ]
+                .width(Length::Fill)
+            ]
+            .spacing(22),
+            checkbox("Use fclones hash cache", results.refresh_settings.cache)
+                .on_toggle(Message::ToggleRefreshCache),
+            text("The cache can make refreshes faster; it does not change which files count as duplicates.")
+                .size(13)
+                .color(MUTED)
+        ]
+        .spacing(10);
+        if results.refresh_settings.legacy_unrecorded {
+            settings = settings.push(
+                text("Original settings were not recorded for this older scan. Review these defaults before refreshing.")
+                    .size(13)
+                    .color(DANGER),
+            );
+        }
+        if let Some(error) = &results.refresh_settings.error {
+            settings = settings.push(
+                container(text(error).color(DANGER))
+                    .padding(10)
+                    .width(Length::Fill)
+                    .style(alert_style),
+            );
+        }
+        settings = settings.push(
+            row![
+                Space::with_width(Length::Fill),
+                button("Close")
+                    .style(secondary_button)
+                    .on_press(Message::ToggleRefreshSettings),
+                button("Refresh with these settings")
+                    .style(primary_button)
+                    .on_press(Message::RefreshResults)
+            ]
+            .spacing(10),
+        );
+        body = body.push(container(settings.padding(18)).style(card_style));
+    }
+    body = body
+        .push(scrollable(groups).height(Length::Fill))
+        .push(row![
             button("‹ Previous").on_press_maybe((results.page > 0).then_some(Message::PageBack)),
             Space::with_width(Length::Fill),
             text(format!(
@@ -1538,35 +1747,34 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
             Space::with_width(Length::Fill),
             button("Next ›")
                 .on_press_maybe((end < results.groups.len()).then_some(Message::PageForward))
-        ],
-        container(
-            row![
-                column![
-                    text("READY TO CLEAN UP").size(11).color(MUTED),
-                    text(format!(
-                        "{} selected · {} recoverable",
-                        count,
-                        bytes_label(bytes)
-                    ))
-                    .size(15)
-                ],
-                Space::with_width(Length::Fill),
-                button("Permanently delete…")
-                    .style(danger_button)
-                    .on_press_maybe((count > 0).then_some(Message::AskDelete)),
-                button("Move selected to Trash")
-                    .style(primary_button)
-                    .on_press_maybe((count > 0).then_some(Message::AskTrash))
-            ]
-            .align_y(alignment::Vertical::Center)
-            .spacing(10)
-        )
-        .padding(14)
-        .style(raised_style)
-    ]
-    .spacing(14)
-    .height(Length::Fill)
-    .into()
+        ])
+        .push(
+            container(
+                row![
+                    column![
+                        text("READY TO CLEAN UP").size(11).color(MUTED),
+                        text(format!(
+                            "{} selected · {} recoverable",
+                            count,
+                            bytes_label(bytes)
+                        ))
+                        .size(15)
+                    ],
+                    Space::with_width(Length::Fill),
+                    button("Permanently delete…")
+                        .style(danger_button)
+                        .on_press_maybe((count > 0).then_some(Message::AskDelete)),
+                    button("Move selected to Trash")
+                        .style(primary_button)
+                        .on_press_maybe((count > 0).then_some(Message::AskTrash))
+                ]
+                .align_y(alignment::Vertical::Center)
+                .spacing(10),
+            )
+            .padding(14)
+            .style(raised_style),
+        );
+    body.height(Length::Fill).into()
 }
 fn group_view(g: &DuplicateGroup) -> Element<'_, Message> {
     let mut body = column![row![
@@ -1993,6 +2201,7 @@ mod tests {
                 name: Some("Saved scan".into()),
                 started_at: std::time::SystemTime::now(),
                 paths: vec![],
+                settings: ScanSettings::default(),
             })
             .unwrap();
         db.finish_scan(id, ScanStatus::Completed, std::time::SystemTime::now())
@@ -2007,6 +2216,12 @@ mod tests {
             Ok(Some(2_684_354_560))
         );
         assert_eq!(parse_size_input("", "Minimum"), Ok(None));
+        for bytes in [1, 1_024, 1_310_720, 1_048_576, 2_684_354_560] {
+            assert_eq!(
+                parse_size_input(&size_input_value(bytes), "Minimum"),
+                Ok(Some(bytes))
+            );
+        }
     }
     #[test]
     fn rejects_malformed_or_out_of_range_size_inputs() {
@@ -2056,7 +2271,7 @@ mod tests {
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db: Database::open_in_memory().unwrap(),
             active_scan_id: None,
             notice: None,
@@ -2081,6 +2296,7 @@ mod tests {
                 name: Some("Scan".into()),
                 started_at: std::time::SystemTime::now(),
                 paths: vec![],
+                settings: ScanSettings::default(),
             })
             .unwrap();
         let cancellation = CancellationToken::default();
@@ -2096,11 +2312,13 @@ mod tests {
             next_scan_run: 5,
             active_scan_run: Some(5),
             running_scan_id: Some(scan_id),
-            scan_mode: Some(ScanMode::Initial),
+            scan_mode: Some(ScanMode::Initial {
+                settings: RefreshSettings::from_scan(ScanSettings::default(), true),
+            }),
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db,
             active_scan_id: Some(scan_id),
             notice: None,
@@ -2145,6 +2363,7 @@ mod tests {
                 name: Some("Scan".into()),
                 started_at: std::time::SystemTime::now(),
                 paths: vec![],
+                settings: ScanSettings::default(),
             })
             .unwrap();
         db.finish_scan(scan_id, ScanStatus::Cancelled, std::time::SystemTime::now())
@@ -2163,11 +2382,13 @@ mod tests {
             next_scan_run: 6,
             active_scan_run: Some(6),
             running_scan_id: None,
-            scan_mode: Some(ScanMode::Initial),
+            scan_mode: Some(ScanMode::Initial {
+                settings: RefreshSettings::from_scan(ScanSettings::default(), true),
+            }),
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db,
             active_scan_id: None,
             notice: None,
@@ -2180,7 +2401,7 @@ mod tests {
             },
         ));
         assert!(matches!(app.screen, Screen::Home));
-        assert!(app.latest_result.is_none());
+        assert!(app.latest_review.is_none());
         assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Cancelled);
     }
 
@@ -2202,7 +2423,7 @@ mod tests {
             next_cleanup_run: 2,
             active_cleanup_run: Some(2),
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db: Database::open_in_memory().unwrap(),
             active_scan_id: None,
             notice: None,
@@ -2322,6 +2543,7 @@ mod tests {
             groups: vec![duplicate_group(1, &["/a", "/b"], &[1])],
             page: 0,
             scan_name: "Saved scan".into(),
+            refresh_settings: RefreshSettings::from_scan(ScanSettings::default(), true),
         };
         let mut db = Database::open_in_memory().unwrap();
         let scan_id = completed_scan(&mut db);
@@ -2344,7 +2566,7 @@ mod tests {
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db,
             active_scan_id: Some(scan_id),
             notice: None,
@@ -2371,6 +2593,7 @@ mod tests {
             groups: vec![duplicate_group(1, &["/a", "/b"], &[1])],
             page: 0,
             scan_name: "Saved scan".into(),
+            refresh_settings: RefreshSettings::from_scan(ScanSettings::default(), true),
         };
         let mut db = Database::open_in_memory().unwrap();
         let scan_id = completed_scan(&mut db);
@@ -2394,7 +2617,7 @@ mod tests {
             next_cleanup_run: 0,
             active_cleanup_run: None,
             cleanup_events: None,
-            latest_result: None,
+            latest_review: None,
             db,
             active_scan_id: Some(scan_id),
             notice: None,

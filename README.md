@@ -8,7 +8,7 @@ Dupekit is a native Rust desktop application for finding and safely cleaning up 
 cargo run --release -p dupekit
 ```
 
-The application stores scan history in `dupekit.sqlite3` in the current working directory. Hash caching is owned and managed by fclones; Dupekit does not duplicate that cache in SQLite.
+The current development build stores scan history in `dupekit.sqlite3` in the current working directory. Before a packaged release, this database will move to Dupekit's per-user application-data directory, with an explicit migration path for existing databases. Hash caching is owned and managed by fclones; Dupekit does not duplicate that cache in SQLite.
 
 ## Safety model
 
