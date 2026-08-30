@@ -1,0 +1,19 @@
+name = "dupekit"
+product-name = "Dupekit"
+version = "0.1.0"
+authors = ["Adam Thomas Howard <adam.thomas.howard@gmail.com>"]
+identifier = "com.howardah.dupekit"
+publisher = "Howardah"
+category = "Utility"
+description = "Safe duplicate-file discovery and cleanup"
+license = "MIT"
+before-packaging-command = "cargo build --release --package dupekit --bin dupekit --target-dir target"
+out-dir = "target/release"
+
+[[binaries]]
+path = "dupekit"
+main = true
+
+[deb]
+section = "utils"
+priority = "optional"

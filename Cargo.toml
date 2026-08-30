@@ -6,6 +6,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+authors = ["Adam Thomas Howard <adam.thomas.howard@gmail.com>"]
 
 [workspace.dependencies]
 anyhow = "1"
