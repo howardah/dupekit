@@ -13,7 +13,7 @@ use iced::{
     Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector,
     alignment, time,
 };
-use std::{path::PathBuf, sync::mpsc::Receiver, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::mpsc::Receiver, time::Duration};
 
 const GROUPS_PER_PAGE: usize = 12;
 
@@ -67,6 +67,17 @@ struct ScanResults {
     groups: Vec<DuplicateGroup>,
     page: usize,
     scan_name: String,
+}
+/// Records why the in-flight scan was started. Refreshes deliberately replace
+/// an existing completed result set; a failed or cancelled refresh must leave
+/// that result set intact.
+#[derive(Debug, Clone)]
+enum ScanMode {
+    Initial,
+    Refresh {
+        previous: ScanResults,
+        selections: BTreeMap<PathBuf, bool>,
+    },
 }
 #[derive(Debug, Clone)]
 struct HistoryItem {
@@ -174,6 +185,7 @@ struct App {
     next_scan_run: u64,
     active_scan_run: Option<u64>,
     running_scan_id: Option<ScanId>,
+    scan_mode: Option<ScanMode>,
     next_cleanup_run: u64,
     active_cleanup_run: Option<u64>,
     latest_result: Option<ScanResult>,
@@ -198,6 +210,7 @@ impl App {
             next_scan_run: 0,
             active_scan_run: None,
             running_scan_id: None,
+            scan_mode: None,
             next_cleanup_run: 0,
             active_cleanup_run: None,
             latest_result: None,
@@ -221,6 +234,7 @@ enum Message {
     MaxSize(String),
     ToggleCache(bool),
     StartScan,
+    RefreshResults,
     ScanCompleted {
         run: u64,
         result: Result<dupekit_core::ScanResult, String>,
@@ -314,49 +328,63 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.notice = Some("Minimum file size cannot exceed maximum file size.".into());
                     return Task::none();
                 }
-                app.notice = None;
-                let config = ScanConfig {
+                return begin_scan(
+                    app,
+                    ScanConfig {
+                        paths: app.paths.clone(),
+                        min_size,
+                        max_size,
+                        cache: app.cache,
+                    },
+                    ScanMode::Initial,
+                );
+            }
+        }
+        Message::RefreshResults => {
+            if app.active_scan_run.is_some() || app.active_cleanup_run.is_some() {
+                return Task::none();
+            }
+            let Screen::Results(previous) = &app.screen else {
+                return Task::none();
+            };
+            let min_size = match parse_size_input(&app.min_size, "Minimum file size") {
+                Ok(value) => value,
+                Err(error) => {
+                    app.notice = Some(error);
+                    return Task::none();
+                }
+            };
+            let max_size = match parse_size_input(&app.max_size, "Maximum file size") {
+                Ok(value) => value,
+                Err(error) => {
+                    app.notice = Some(error);
+                    return Task::none();
+                }
+            };
+            if min_size.zip(max_size).is_some_and(|(min, max)| min > max) {
+                app.notice = Some("Minimum file size cannot exceed maximum file size.".into());
+                return Task::none();
+            }
+            let selections = selection_by_path(&previous.groups);
+            return begin_scan(
+                app,
+                ScanConfig {
                     paths: app.paths.clone(),
                     min_size,
                     max_size,
                     cache: app.cache,
-                };
-                app.next_scan_run = app.next_scan_run.wrapping_add(1);
-                let run = app.next_scan_run;
-                let cancellation = CancellationToken::default();
-                let worker_cancellation = cancellation.clone();
-                let (events, event_receiver) = std::sync::mpsc::channel();
-                app.active_scan_id = match app.db.create_scan(&NewScan {
-                    name: Some("Scan".into()),
-                    started_at: std::time::SystemTime::now(),
-                    paths: app.paths.clone(),
-                }) {
-                    Ok(id) => Some(id),
-                    Err(error) => {
-                        app.notice = Some(format!("Could not save scan history: {error}"));
-                        None
-                    }
-                };
-                app.running_scan_id = app.active_scan_id;
-                app.scan_cancel = Some(cancellation);
-                app.scan_events = Some(event_receiver);
-                app.active_scan_run = Some(run);
-                app.screen = Screen::Scanning(ScanProgress::default());
-                return Task::perform(
-                    async move {
-                        let result = FclonesScanner
-                            .scan(config, events, worker_cancellation)
-                            .map_err(|error| error.to_string());
-                        Message::ScanCompleted { run, result }
-                    },
-                    |message| message,
-                );
-            }
+                },
+                ScanMode::Refresh {
+                    previous: previous.clone(),
+                    selections,
+                },
+            );
         }
         Message::ScanCompleted { run, result } => {
             if app.active_scan_run != Some(run) {
                 return Task::none();
             }
+            let mode = app.scan_mode.take().unwrap_or(ScanMode::Initial);
             let was_cancelling = matches!(app.screen, Screen::Cancelling)
                 || app
                     .scan_cancel
@@ -371,37 +399,42 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // persisted or shown as a failed/completed scan.
             if was_cancelling {
                 app.running_scan_id = None;
-                app.active_scan_id = None;
-                app.screen = Screen::Home;
+                match mode {
+                    ScanMode::Initial => {
+                        app.active_scan_id = None;
+                        app.screen = Screen::Home;
+                    }
+                    ScanMode::Refresh { previous, .. } => {
+                        app.latest_result = Some(ScanResult::from_groups(previous.groups.clone()));
+                        app.screen = Screen::Results(previous);
+                        append_notice(
+                            app,
+                            "Refresh cancelled; previous results are unchanged.".into(),
+                        );
+                    }
+                }
                 return Task::none();
             }
             match result {
                 Ok(result) => {
                     let mut displayed_result = result;
+                    if let ScanMode::Refresh { selections, .. } = &mode {
+                        restore_selection_by_path(&mut displayed_result.groups, selections);
+                        displayed_result = ScanResult::from_groups(displayed_result.groups);
+                    }
                     if let Some(id) = app.running_scan_id.take() {
-                        let persisted = match app.db.replace_results(
+                        let persisted = match app.db.replace_results_and_load(
                             id,
                             &displayed_result.groups,
                             &displayed_result.summary,
                             std::time::SystemTime::now(),
                         ) {
-                            Ok(()) => match app.db.groups(id) {
-                                // Reload database-owned IDs so subsequent checkbox updates
-                                // target exactly this saved result set.
-                                Ok(groups) => {
-                                    displayed_result = ScanResult::from_groups(groups);
-                                    true
-                                }
-                                Err(error) => {
-                                    append_notice(
-                                        app,
-                                        format!(
-                                            "Scan finished, but saved results could not be reloaded: {error}"
-                                        ),
-                                    );
-                                    false
-                                }
-                            },
+                            // Database-owned IDs are returned by the same
+                            // transaction that writes the new result set.
+                            Ok(groups) => {
+                                displayed_result = ScanResult::from_groups(groups);
+                                true
+                            }
                             Err(error) => {
                                 append_notice(
                                     app,
@@ -416,6 +449,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         refresh_history(app);
                         if persisted && matches!(app.screen, Screen::Scanning(_)) {
                             app.active_scan_id = Some(id);
+                        } else if !persisted {
+                            match &mode {
+                                ScanMode::Initial => app.active_scan_id = None,
+                                ScanMode::Refresh { previous, .. } => {
+                                    app.latest_result =
+                                        Some(ScanResult::from_groups(previous.groups.clone()));
+                                    app.screen = Screen::Results(previous.clone());
+                                    return Task::none();
+                                }
+                            }
                         }
                     }
                     if matches!(app.screen, Screen::Scanning(_)) {
@@ -428,7 +471,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                 }
                 Err(error) => {
-                    if let Some(id) = app.running_scan_id.take() {
+                    if matches!(mode, ScanMode::Initial)
+                        && let Some(id) = app.running_scan_id.take()
+                    {
                         if let Err(persist_error) = app.db.finish_scan(
                             id,
                             dupekit_storage::ScanStatus::Failed,
@@ -447,8 +492,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         }
                     }
                     if matches!(app.screen, Screen::Scanning(_)) {
-                        append_notice(app, format!("Scan failed: {error}"));
-                        app.screen = Screen::Home;
+                        match mode {
+                            ScanMode::Initial => {
+                                append_notice(app, format!("Scan failed: {error}"));
+                                app.screen = Screen::Home;
+                            }
+                            ScanMode::Refresh { previous, .. } => {
+                                app.running_scan_id = None;
+                                app.latest_result =
+                                    Some(ScanResult::from_groups(previous.groups.clone()));
+                                app.screen = Screen::Results(previous);
+                                append_notice(
+                                    app,
+                                    format!(
+                                        "Refresh failed; previous results are unchanged: {error}"
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -479,7 +540,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 cancel.cancel();
             }
             let cancelled_scan_id = app.running_scan_id.take();
-            if let Some(id) = cancelled_scan_id {
+            if matches!(app.scan_mode, Some(ScanMode::Initial))
+                && let Some(id) = cancelled_scan_id
+            {
                 if let Err(error) = app.db.finish_scan(
                     id,
                     dupekit_storage::ScanStatus::Cancelled,
@@ -495,7 +558,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Do not clear the worker bookkeeping here. The synchronous
             // fclones call may still own ~/.cache/fclones/db for some time.
             // ScanCompleted performs that cleanup after it has returned.
-            if app.active_scan_id == cancelled_scan_id {
+            if matches!(app.scan_mode, Some(ScanMode::Initial))
+                && app.active_scan_id == cancelled_scan_id
+            {
                 app.active_scan_id = None;
             }
             app.screen = Screen::Cancelling
@@ -789,6 +854,101 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
     };
     Task::none()
+}
+fn begin_scan(app: &mut App, config: ScanConfig, mode: ScanMode) -> Task<Message> {
+    app.notice = None;
+    app.next_scan_run = app.next_scan_run.wrapping_add(1);
+    let run = app.next_scan_run;
+    let cancellation = CancellationToken::default();
+    let worker_cancellation = cancellation.clone();
+    let (events, event_receiver) = std::sync::mpsc::channel();
+
+    if matches!(mode, ScanMode::Initial) {
+        app.active_scan_id = match app.db.create_scan(&NewScan {
+            name: Some("Scan".into()),
+            started_at: std::time::SystemTime::now(),
+            paths: app.paths.clone(),
+        }) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                app.notice = Some(format!("Could not save scan history: {error}"));
+                None
+            }
+        };
+    }
+    // A refresh updates the same saved scan atomically, keeping its cleanup
+    // audit and history entry instead of creating a misleading duplicate row.
+    app.running_scan_id = app.active_scan_id;
+    app.scan_mode = Some(mode);
+    app.scan_cancel = Some(cancellation);
+    app.scan_events = Some(event_receiver);
+    app.active_scan_run = Some(run);
+    app.screen = Screen::Scanning(ScanProgress::default());
+    Task::perform(
+        async move {
+            let result = FclonesScanner
+                .scan(config, events, worker_cancellation)
+                .map_err(|error| error.to_string());
+            Message::ScanCompleted { run, result }
+        },
+        |message| message,
+    )
+}
+
+fn selection_by_path(groups: &[DuplicateGroup]) -> BTreeMap<PathBuf, bool> {
+    groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), group.is_selected(file.id)))
+        })
+        .collect()
+}
+
+/// Restores choices from the preceding result set by path, rather than by the
+/// database IDs which are replaced on every scan. New files retain fclones'
+/// preferred-directory default. If files have regrouped and the old choices
+/// would remove every copy, retain the scanner's default kept copy.
+fn restore_selection_by_path(groups: &mut [DuplicateGroup], selections: &BTreeMap<PathBuf, bool>) {
+    for group in groups {
+        let default_kept = group
+            .files
+            .iter()
+            .find(|file| !group.is_selected(file.id))
+            .map(|file| file.id);
+        let desired = group
+            .files
+            .iter()
+            .filter_map(|file| match selections.get(&file.path) {
+                Some(selected) => selected.then_some(file.id),
+                // A new file has no former choice, so preserve the scanner's
+                // preferred-directory default for it.
+                None => group.is_selected(file.id).then_some(file.id),
+            })
+            .collect::<Vec<_>>();
+        let has_known_path = group
+            .files
+            .iter()
+            .any(|file| selections.contains_key(&file.path));
+        // A completely new group keeps its scanner default. Unlike that case,
+        // an all-false known selection intentionally clears this group.
+        if !has_known_path {
+            continue;
+        }
+        let file_ids = group.files.iter().map(|file| file.id).collect::<Vec<_>>();
+        for id in file_ids {
+            let _ = group.set_selected(id, false);
+        }
+        let keep = (desired.len() == group.files.len())
+            .then_some(default_kept.unwrap_or(group.files[0].id));
+        for id in desired {
+            if Some(id) != keep {
+                let _ = group.set_selected(id, true);
+            }
+        }
+    }
 }
 fn toggle_file(groups: &mut [DuplicateGroup], id: DuplicateFileId) {
     for group in groups {
@@ -1177,6 +1337,9 @@ fn results(results: &ScanResults) -> Element<'_, Message> {
                 .size(14)
                 .color(MUTED)
                 .width(Length::Fill),
+                button("Refresh results")
+                    .style(secondary_button)
+                    .on_press(Message::RefreshResults),
                 text("Automatic selection").size(13).color(MUTED),
                 pick_list(&UiPolicy::ALL[..], None::<UiPolicy>, Message::ApplyPolicy)
                     .placeholder("Select duplicates")
@@ -1629,6 +1792,37 @@ fn row_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
 mod tests {
     use super::*;
     use dupekit_core::GroupId;
+
+    fn duplicate_group(id: u64, paths: &[&str], selected: &[usize]) -> DuplicateGroup {
+        let files = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| DuplicateFile {
+                id: DuplicateFileId(id * 100 + index as u64),
+                path: PathBuf::from(path),
+                size: 42,
+                modified: None,
+            })
+            .collect();
+        let mut group = DuplicateGroup::new(GroupId(id), 42, files).unwrap();
+        for &index in selected {
+            group.set_selected(group.files[index].id, true).unwrap();
+        }
+        group
+    }
+
+    fn completed_scan(db: &mut Database) -> ScanId {
+        let id = db
+            .create_scan(&NewScan {
+                name: Some("Saved scan".into()),
+                started_at: std::time::SystemTime::now(),
+                paths: vec![],
+            })
+            .unwrap();
+        db.finish_scan(id, ScanStatus::Completed, std::time::SystemTime::now())
+            .unwrap();
+        id
+    }
     #[test]
     fn parses_human_sizes() {
         assert_eq!(parse_size_input("1 MB", "Minimum"), Ok(Some(1_048_576)));
@@ -1682,6 +1876,7 @@ mod tests {
             next_scan_run: 2,
             active_scan_run: Some(2),
             running_scan_id: None,
+            scan_mode: None,
             next_cleanup_run: 0,
             active_cleanup_run: None,
             latest_result: None,
@@ -1724,6 +1919,7 @@ mod tests {
             next_scan_run: 5,
             active_scan_run: Some(5),
             running_scan_id: Some(scan_id),
+            scan_mode: Some(ScanMode::Initial),
             next_cleanup_run: 0,
             active_cleanup_run: None,
             latest_result: None,
@@ -1789,6 +1985,7 @@ mod tests {
             next_scan_run: 6,
             active_scan_run: Some(6),
             running_scan_id: None,
+            scan_mode: Some(ScanMode::Initial),
             next_cleanup_run: 0,
             active_cleanup_run: None,
             latest_result: None,
@@ -1822,6 +2019,7 @@ mod tests {
             next_scan_run: 0,
             active_scan_run: None,
             running_scan_id: None,
+            scan_mode: None,
             next_cleanup_run: 2,
             active_cleanup_run: Some(2),
             latest_result: None,
@@ -1886,5 +2084,155 @@ mod tests {
         toggle_file(&mut groups, second);
         assert!(groups[0].is_selected(first));
         assert!(!groups[0].is_selected(second));
+    }
+
+    #[test]
+    fn refresh_restores_known_choices_by_path_and_keeps_new_group_defaults() {
+        let previous = vec![duplicate_group(1, &["/a", "/b"], &[1])];
+        let selections = selection_by_path(&previous);
+        let mut refreshed = vec![
+            // The scanner selected /c by default. The prior explicit choice
+            // for /b and this new path's default are both retained.
+            duplicate_group(2, &["/a", "/b", "/c"], &[2]),
+            // This entirely new group must remain as the scanner supplied it.
+            duplicate_group(3, &["/d", "/e"], &[1]),
+        ];
+
+        restore_selection_by_path(&mut refreshed, &selections);
+
+        assert!(!refreshed[0].is_selected(refreshed[0].files[0].id));
+        assert!(refreshed[0].is_selected(refreshed[0].files[1].id));
+        assert!(refreshed[0].is_selected(refreshed[0].files[2].id));
+        assert!(refreshed[1].is_selected(refreshed[1].files[1].id));
+    }
+
+    #[test]
+    fn refresh_regrouping_never_selects_every_copy() {
+        // These two selected paths came from different former groups. They
+        // can become one group after content changes or a newly found match.
+        let previous = vec![
+            duplicate_group(1, &["/keep-a", "/remove-a"], &[1]),
+            duplicate_group(2, &["/keep-b", "/remove-b"], &[1]),
+        ];
+        let selections = selection_by_path(&previous);
+        let mut regrouped = vec![duplicate_group(3, &["/remove-a", "/remove-b"], &[1])];
+
+        restore_selection_by_path(&mut regrouped, &selections);
+
+        assert_eq!(regrouped[0].selected_ids().len(), 1);
+        assert!(regrouped[0].validate_selection().is_ok());
+        // The scanner's formerly kept first file is retained as the safe tie-breaker.
+        assert!(!regrouped[0].is_selected(regrouped[0].files[0].id));
+    }
+
+    #[test]
+    fn refresh_preserves_a_clear_selection_for_known_paths() {
+        let previous = vec![duplicate_group(1, &["/a", "/b"], &[])];
+        let selections = selection_by_path(&previous);
+        let mut refreshed = vec![duplicate_group(2, &["/a", "/b"], &[1])];
+
+        restore_selection_by_path(&mut refreshed, &selections);
+
+        assert!(refreshed[0].selected_ids().is_empty());
+    }
+
+    #[test]
+    fn failed_refresh_restores_results_and_keeps_completed_history() {
+        let previous = ScanResults {
+            groups: vec![duplicate_group(1, &["/a", "/b"], &[1])],
+            page: 0,
+            scan_name: "Saved scan".into(),
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        let scan_id = completed_scan(&mut db);
+        let mut app = App {
+            screen: Screen::Scanning(ScanProgress::default()),
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: Some(CancellationToken::default()),
+            scan_events: None,
+            next_scan_run: 1,
+            active_scan_run: Some(1),
+            running_scan_id: Some(scan_id),
+            scan_mode: Some(ScanMode::Refresh {
+                selections: selection_by_path(&previous.groups),
+                previous: previous.clone(),
+            }),
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
+            latest_result: None,
+            db,
+            active_scan_id: Some(scan_id),
+            notice: None,
+        };
+
+        drop(update(
+            &mut app,
+            Message::ScanCompleted {
+                run: 1,
+                result: Err("scanner unavailable".into()),
+            },
+        ));
+
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Completed);
+        assert_eq!(app.active_scan_id, Some(scan_id));
+        assert!(
+            matches!(&app.screen, Screen::Results(results) if results.groups == previous.groups)
+        );
+    }
+
+    #[test]
+    fn cancelled_refresh_restores_results_and_keeps_completed_history() {
+        let previous = ScanResults {
+            groups: vec![duplicate_group(1, &["/a", "/b"], &[1])],
+            page: 0,
+            scan_name: "Saved scan".into(),
+        };
+        let mut db = Database::open_in_memory().unwrap();
+        let scan_id = completed_scan(&mut db);
+        let cancellation = CancellationToken::default();
+        let mut app = App {
+            screen: Screen::Scanning(ScanProgress::default()),
+            paths: vec![],
+            min_size: String::new(),
+            max_size: String::new(),
+            cache: false,
+            history: vec![],
+            scan_cancel: Some(cancellation.clone()),
+            scan_events: None,
+            next_scan_run: 1,
+            active_scan_run: Some(1),
+            running_scan_id: Some(scan_id),
+            scan_mode: Some(ScanMode::Refresh {
+                selections: selection_by_path(&previous.groups),
+                previous: previous.clone(),
+            }),
+            next_cleanup_run: 0,
+            active_cleanup_run: None,
+            latest_result: None,
+            db,
+            active_scan_id: Some(scan_id),
+            notice: None,
+        };
+
+        drop(update(&mut app, Message::CancelScan));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Completed);
+        drop(update(
+            &mut app,
+            Message::ScanCompleted {
+                run: 1,
+                result: Err("cancelled".into()),
+            },
+        ));
+
+        assert_eq!(app.db.scan(scan_id).unwrap().status, ScanStatus::Completed);
+        assert_eq!(app.active_scan_id, Some(scan_id));
+        assert!(
+            matches!(&app.screen, Screen::Results(results) if results.groups == previous.groups)
+        );
     }
 }

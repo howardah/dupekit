@@ -187,6 +187,19 @@ impl Database {
         summary: &ScanSummary,
         finished_at: SystemTime,
     ) -> Result<()> {
+        self.replace_results_and_load(scan_id, groups, summary, finished_at)
+            .map(|_| ())
+    }
+    /// Atomically replaces a scan's result set and returns its database-owned
+    /// IDs. If loading the replacement cannot complete, the transaction is
+    /// rolled back so callers can safely keep displaying the old result set.
+    pub fn replace_results_and_load(
+        &mut self,
+        scan_id: ScanId,
+        groups: &[DuplicateGroup],
+        summary: &ScanSummary,
+        finished_at: SystemTime,
+    ) -> Result<Vec<DuplicateGroup>> {
         let tx = self.connection.transaction()?;
         if tx
             .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |_| Ok(()))
@@ -203,8 +216,9 @@ impl Database {
             }
         }
         tx.execute("UPDATE scans SET status='completed', finished_at=?2, duplicate_bytes=?3, duplicate_files=?4, duplicate_groups=?5 WHERE id=?1", params![scan_id, time_to_millis(finished_at)?, u64_to_i64(summary.recoverable_bytes)?, u64_to_i64(summary.duplicate_files)?, u64_to_i64(summary.duplicate_groups)?])?;
+        let loaded = groups_from_connection(&tx, scan_id)?;
         tx.commit()?;
-        Ok(())
+        Ok(loaded)
     }
     /// Marks a scan as failed or cancelled when it has no completed result set.
     pub fn finish_scan(
@@ -276,25 +290,7 @@ impl Database {
     }
     /// Loads all duplicate groups, restoring persisted selection state.
     pub fn groups(&self, scan_id: ScanId) -> Result<Vec<DuplicateGroup>> {
-        if self
-            .connection
-            .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |_| Ok(()))
-            .optional()?
-            .is_none()
-        {
-            return Err(StorageError::ScanNotFound(scan_id));
-        }
-        let mut stmt = self
-            .connection
-            .prepare("SELECT id,file_size FROM duplicate_groups WHERE scan_id=?1 ORDER BY id")?;
-        let raw = stmt
-            .query_map([scan_id], |r| {
-                Ok((r.get::<_, i64>(0)?, i64_to_u64(r.get(1)?)?))
-            })?
-            .collect::<std::result::Result<Vec<(i64, u64)>, _>>()?;
-        raw.into_iter()
-            .map(|(id, file_size)| self.group(id, file_size))
-            .collect()
+        groups_from_connection(&self.connection, scan_id)
     }
     /// Persists one checkbox change while refusing to select every copy in a group.
     pub fn set_selected(&mut self, file_id: DuplicateFileId, selected: bool) -> Result<()> {
@@ -506,43 +502,68 @@ impl Database {
             })
             .collect()
     }
-    fn group(&self, id: i64, file_size: u64) -> Result<DuplicateGroup> {
-        let mut stmt=self.connection.prepare("SELECT id,path,size,modified_at,selected FROM duplicate_files WHERE group_id=?1 ORDER BY id")?;
-        let raw = stmt
-            .query_map([id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, Option<i64>>(3)?,
-                    r.get::<_, i64>(4)? != 0,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut selected = Vec::new();
-        let files = raw
-            .into_iter()
-            .map(|(file_id, path, size, modified, checked)| {
-                if checked {
-                    selected.push(DuplicateFileId(i64_to_u64(file_id)?));
-                }
-                Ok(DuplicateFile {
-                    id: DuplicateFileId(i64_to_u64(file_id)?),
-                    path: decode_path(&path)?,
-                    size: i64_to_u64(size)?,
-                    modified: modified.map(millis_to_time).transpose()?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut group = DuplicateGroup::new(GroupId(i64_to_u64(id)?), file_size, files)
-            .map_err(|_| StorageError::InvalidTime)?;
-        for file_id in selected {
-            group
-                .set_selected(file_id, true)
-                .map_err(|_| StorageError::InvalidTime)?;
-        }
-        Ok(group)
+}
+
+fn groups_from_connection(connection: &Connection, scan_id: ScanId) -> Result<Vec<DuplicateGroup>> {
+    if connection
+        .query_row("SELECT 1 FROM scans WHERE id=?1", [scan_id], |_| Ok(()))
+        .optional()?
+        .is_none()
+    {
+        return Err(StorageError::ScanNotFound(scan_id));
     }
+    let mut stmt = connection
+        .prepare("SELECT id,file_size FROM duplicate_groups WHERE scan_id=?1 ORDER BY id")?;
+    let raw = stmt
+        .query_map([scan_id], |r| {
+            Ok((r.get::<_, i64>(0)?, i64_to_u64(r.get(1)?)?))
+        })?
+        .collect::<std::result::Result<Vec<(i64, u64)>, _>>()?;
+    raw.into_iter()
+        .map(|(id, file_size)| group_from_connection(connection, id, file_size))
+        .collect()
+}
+
+fn group_from_connection(
+    connection: &Connection,
+    id: i64,
+    file_size: u64,
+) -> Result<DuplicateGroup> {
+    let mut stmt=connection.prepare("SELECT id,path,size,modified_at,selected FROM duplicate_files WHERE group_id=?1 ORDER BY id")?;
+    let raw = stmt
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut selected = Vec::new();
+    let files = raw
+        .into_iter()
+        .map(|(file_id, path, size, modified, checked)| {
+            if checked {
+                selected.push(DuplicateFileId(i64_to_u64(file_id)?));
+            }
+            Ok(DuplicateFile {
+                id: DuplicateFileId(i64_to_u64(file_id)?),
+                path: decode_path(&path)?,
+                size: i64_to_u64(size)?,
+                modified: modified.map(millis_to_time).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut group = DuplicateGroup::new(GroupId(i64_to_u64(id)?), file_size, files)
+        .map_err(|_| StorageError::InvalidTime)?;
+    for file_id in selected {
+        group
+            .set_selected(file_id, true)
+            .map_err(|_| StorageError::InvalidTime)?;
+    }
+    Ok(group)
 }
 
 fn insert_scan(tx: &Transaction<'_>, scan: &NewScan) -> Result<ScanId> {
@@ -745,6 +766,64 @@ mod tests {
             Err(StorageError::LastCopySelected { .. })
         ));
         db.set_selected(first, false).unwrap();
+    }
+
+    #[test]
+    fn replacement_returns_database_owned_ids_with_selection_intact() {
+        let (_file, mut db) = db();
+        let id = db.create_scan(&scan(PathBuf::from("/a"))).unwrap();
+        db.replace_results(
+            id,
+            &results(),
+            &ScanSummary {
+                duplicate_groups: 1,
+                duplicate_files: 2,
+                recoverable_bytes: 20,
+            },
+            at(2),
+        )
+        .unwrap();
+
+        let mut replacement = DuplicateGroup::new(
+            GroupId(900),
+            20,
+            vec![
+                DuplicateFile {
+                    id: DuplicateFileId(901),
+                    path: PathBuf::from("/photos/été a.jpg"),
+                    size: 20,
+                    modified: Some(at(2_000)),
+                },
+                DuplicateFile {
+                    id: DuplicateFileId(902),
+                    path: PathBuf::from("/backup/été a.jpg"),
+                    size: 20,
+                    modified: None,
+                },
+            ],
+        )
+        .unwrap();
+        replacement
+            .set_selected(DuplicateFileId(902), true)
+            .unwrap();
+        let replacement = vec![replacement];
+        let loaded = db
+            .replace_results_and_load(
+                id,
+                &replacement,
+                &ScanSummary {
+                    duplicate_groups: 1,
+                    duplicate_files: 2,
+                    recoverable_bytes: 20,
+                },
+                at(3),
+            )
+            .unwrap();
+
+        assert_ne!(loaded[0].id, replacement[0].id);
+        assert_ne!(loaded[0].files[0].id, replacement[0].files[0].id);
+        assert!(loaded[0].is_selected(loaded[0].files[1].id));
+        assert_eq!(loaded, db.groups(id).unwrap());
     }
 
     #[test]
