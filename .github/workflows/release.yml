@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - main
+      - master
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -12,14 +12,14 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG_PREFIX: proteus-player-v
+  RELEASE_TAG_PREFIX: dupekit-v
 
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      release_body: ${{ steps.build_notes.outputs.release_body }}
+      release_body: ${{ steps.release_notes.outputs.release_body }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -28,29 +28,26 @@ jobs:
       - name: Read Cargo package version
         id: version
         run: |
-          VERSION="$(awk -F'"' '/^\[package\]/{in_package=1;next} in_package && /^version = /{print $2; exit}' Cargo.toml)"
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dupekit") | .version')"
           if [ -z "$VERSION" ]; then
-            echo "Could not determine package version from Cargo.toml" >&2
+            echo "Could not determine the dupekit package version" >&2
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        id: git_cliff
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --unreleased --tag "${{ env.RELEASE_TAG_PREFIX }}${{ steps.version.outputs.version }}"
+        id: release_notes
         env:
-          OUTPUT: release-notes.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      - name: Build release notes
-        id: build_notes
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if [ ! -s release-notes.md ]; then
-            echo "No notable changes in this release." > release-notes.md
-          fi
+          TAG="${RELEASE_TAG_PREFIX}${VERSION}"
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${TAG}" \
+            -f target_commitish="${GITHUB_SHA}" \
+            --jq '.body // "No notable changes in this release."' > release-notes.md
 
           DELIM="RELEASE_BODY_$(date +%s)_$RANDOM"
           {
@@ -71,7 +68,7 @@ jobs:
           RELEASE_BODY: ${{ needs.prepare-release.outputs.release_body }}
         run: |
           TAG="${RELEASE_TAG_PREFIX}${VERSION}"
-          TITLE="Proteus Player v${VERSION}"
+          TITLE="Dupekit v${VERSION}"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release edit "${TAG}" --title "${TITLE}" --notes "${RELEASE_BODY}"
@@ -79,7 +76,7 @@ jobs:
             gh release create "${TAG}" --title "${TITLE}" --notes "${RELEASE_BODY}"
           fi
 
-  publish-iced:
+  publish-dupekit:
     needs: [prepare-release, create-release]
     strategy:
       fail-fast: false
@@ -117,14 +114,14 @@ jobs:
 
       - name: Disable before-packaging hook in CI (macOS/Linux)
         if: matrix.kind != 'windows'
-        run: sed -i.bak '/^before-packaging-command = "cargo build --release"$/d' packager.toml
+        run: sed -i.bak '/^before-packaging-command = /d' packager.toml
 
       - name: Disable before-packaging hook in CI (Windows)
         if: matrix.kind == 'windows'
         shell: pwsh
         run: |
           $content = Get-Content packager.toml -Raw
-          $updated = $content -replace '(?m)^before-packaging-command = "cargo build --release"\r?\n', ''
+          $updated = $content -replace '(?m)^before-packaging-command = .*\r?\n', ''
           Set-Content packager.toml -Value $updated -NoNewline
 
       - name: Install Rust stable
@@ -164,7 +161,7 @@ jobs:
         if: matrix.kind != 'windows'
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$TARGET"
+        run: cargo build --release --package dupekit --bin dupekit --target "$TARGET"
 
       - name: Build and package (macOS/Linux)
         if: matrix.kind != 'windows'
@@ -178,7 +175,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         shell: pwsh
-        run: cargo build --release --target $env:TARGET
+        run: cargo build --release --package dupekit --bin dupekit --target $env:TARGET
 
       - name: Build and package (Windows)
         if: matrix.kind == 'windows'
@@ -204,7 +201,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           KIND: ${{ matrix.kind }}
-          PRODUCT_NAME: Proteus Player
+          PRODUCT_NAME: Dupekit
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -220,7 +217,7 @@ jobs:
 
             output_name="$file_name"
             if [ "$KIND" = "linux" ]; then
-              output_name="${output_name/#proteus-player/$PRODUCT_NAME}"
+              output_name="${output_name/#dupekit/$PRODUCT_NAME}"
             fi
 
             cp "$artifact" "dist/$output_name"
@@ -229,7 +226,7 @@ jobs:
               -name '*.deb' -o \
               -name '*.AppImage' -o \
               -name '*.appimage' -o \
-              -name 'proteus-player*.tar.gz' -o \
+              -name 'dupekit*.tar.gz' -o \
               -name '*.pkg.tar*' \
             \))
 
@@ -253,7 +250,7 @@ jobs:
         id: collect_windows
         shell: pwsh
         env:
-          PRODUCT_NAME: Proteus Player
+          PRODUCT_NAME: Dupekit
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Get-ChildItem -Path target/release -File |
@@ -262,7 +259,7 @@ jobs:
               ($_.Name -like "*-setup.exe")
             } |
             ForEach-Object {
-              $renamed = $_.Name -replace '^proteus-player', $env:PRODUCT_NAME
+              $renamed = $_.Name -replace '^dupekit', $env:PRODUCT_NAME
               $destination = Join-Path "dist" $renamed
               Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
             }
@@ -297,7 +294,7 @@ jobs:
           }
 
   publish-downloads-manifest:
-    needs: [prepare-release, publish-iced]
+    needs: [prepare-release, publish-dupekit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
