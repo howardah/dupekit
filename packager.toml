@@ -9,6 +9,7 @@ description = "Safe duplicate-file discovery and cleanup"
 # Select the platform's default formats. Without this, the Debian-only
 # configuration is ignored on macOS and packager finds no enabled format.
 formats = ["default"]
+icons = ["assets/dupekit.icns"]
 before-packaging-command = "cargo build --release --package dupekit --bin dupekit --target-dir target"
 out-dir = "target/release"
 
