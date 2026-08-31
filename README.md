@@ -4,7 +4,7 @@ Dupekit is a native Rust desktop application for finding and safely cleaning up 
 
 ## Alpha status
 
-Dupekit is alpha software. Features, interfaces, and the database schema may change between releases. Back up important files before using cleanup actions.
+Dupekit is alpha software. It's largely stable because of its reliance on a the `fclones` crate, but use with caution. Features, interfaces, and the database schema may change between releases. Back up important files before using cleanup actions.
 
 ## Run
 
