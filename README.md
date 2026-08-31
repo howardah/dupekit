@@ -2,13 +2,17 @@
 
 Dupekit is a native Rust desktop application for finding and safely cleaning up duplicate files. It uses the `fclones` crate directly for scanning, Iced for the UI, and an application-owned SQLite database for scan history.
 
+## Alpha status
+
+Dupekit is alpha software. Features, interfaces, and the database schema may change between releases. Back up important files before using cleanup actions.
+
 ## Run
 
 ```sh
 cargo run --release -p dupekit
 ```
 
-The current development build stores scan history in `dupekit.sqlite3` in the current working directory. Before a packaged release, this database will move to Dupekit's per-user application-data directory, with an explicit migration path for existing databases. Hash caching is owned and managed by fclones; Dupekit does not duplicate that cache in SQLite.
+Dupekit stores its SQLite scan history database in a `dupekit` folder in your operating system's local data directory. fclones owns and manages hash caching. Dupekit does not duplicate that cache in SQLite.
 
 ## Safety model
 

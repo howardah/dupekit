@@ -13,7 +13,7 @@ use iced::{
     Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, Vector,
     alignment, time,
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::mpsc::Receiver, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::mpsc::Receiver, time::Duration};
 
 const GROUPS_PER_PAGE: usize = 12;
 
@@ -268,8 +268,9 @@ struct App {
 }
 impl App {
     fn new() -> Self {
-        let db = Database::open("dupekit.sqlite3")
-            .unwrap_or_else(|_| Database::open_in_memory().expect("SQLite must be available"));
+        let db = local_database_path()
+            .and_then(|path| Database::open(path).ok())
+            .unwrap_or_else(|| Database::open_in_memory().expect("SQLite must be available"));
         let history = history_items(&db).unwrap_or_default();
         Self {
             screen: Screen::Home,
@@ -297,6 +298,12 @@ impl App {
     fn scan_worker_active(&self) -> bool {
         self.active_scan_run.is_some()
     }
+}
+
+fn local_database_path() -> Option<PathBuf> {
+    let directory = dirs::data_local_dir()?.join("dupekit");
+    fs::create_dir_all(&directory).ok()?;
+    Some(directory.join("dupekit.sqlite3"))
 }
 #[derive(Debug, Clone)]
 enum Message {
