@@ -1220,7 +1220,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dupekit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dupekit-core",
  "dupekit-storage",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "dupekit-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fclones",
  "tempfile",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "dupekit-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dupekit-core",
  "rusqlite",

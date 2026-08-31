@@ -1,6 +1,6 @@
 name = "dupekit"
 product-name = "Dupekit"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Adam Thomas Howard <adam.thomas.howard@gmail.com>"]
 identifier = "com.howardah.dupekit"
 publisher = "Howardah"
