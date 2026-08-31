@@ -1,3 +1,0 @@
-# agents.default_subagent_model = "gpt-5.6-luna"
-agents.default_subagent_model = "gpt-5.6-terra"
-agents.default_subagent_reasoning_effort = "medium"
