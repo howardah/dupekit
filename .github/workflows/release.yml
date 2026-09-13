@@ -168,7 +168,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           FORMATS: ${{ matrix.formats }}
-        run: cargo packager --release --target "$TARGET" --binaries-dir "target/$TARGET/release" --formats "$FORMATS"
+        # Relative binary paths are resolved from Packager's output directory.
+        # Point it at Cargo's target-specific release directory so it finds the
+        # binary produced by the preceding `cargo build --target` command.
+        run: cargo packager --release --target "$TARGET" --out-dir "target/$TARGET/release" --formats "$FORMATS"
 
       - name: Build binary for target (Windows)
         if: matrix.kind == 'windows'
@@ -193,7 +196,7 @@ jobs:
             $formats = "nsis"
           }
 
-          cargo packager --release --target $env:TARGET --binaries-dir "target/$env:TARGET/release" --formats $formats
+          cargo packager --release --target $env:TARGET --out-dir "target/$env:TARGET/release" --formats $formats
 
       - name: Collect package artifacts (macOS/Linux)
         if: matrix.kind != 'windows'
@@ -251,9 +254,10 @@ jobs:
         shell: pwsh
         env:
           PRODUCT_NAME: Dupekit
+          TARGET: ${{ matrix.target }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Get-ChildItem -Path target/release -File |
+          Get-ChildItem -Path "target/$env:TARGET/release" -File |
             Where-Object {
               ($_.Extension -eq ".msi") -or
               ($_.Name -like "*-setup.exe")
