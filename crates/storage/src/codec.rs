@@ -63,7 +63,7 @@ pub(crate) fn decode_path(bytes: &[u8]) -> Result<PathBuf> {
     if bytes.first() != Some(&1) || (bytes.len() - 1) % 2 != 0 {
         return Err(StorageError::IncompatiblePath);
     }
-    let w = bytes[1..]
+    let w: Vec<u16> = bytes[1..]
         .chunks_exact(2)
         .map(|x| u16::from_le_bytes([x[0], x[1]]))
         .collect();
